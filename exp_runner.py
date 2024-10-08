@@ -354,18 +354,18 @@ class Runner:
         logging.info('End')
 
     def validate_distance_field(self, resolution=64, scale=1.0):
-        bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)*scale
-        bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)*scale
+        MID = resolution // 2
+        
+        bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)/scale
+        bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)/scale
         df = self.renderer.extract_fields(bound_min, bound_max, resolution=resolution)
-
+        #np.savez_compressed(os.path.join(self.base_exp_dir, 'distance_fields', 'sdf_512.npz'), sdf=df[MID, :, :])
         df_surface = abs(df)
         df_surface[df > 0.2] = 0.2
 
-        MID = int(resolution * 0.51)
-        
+        #MID = resolution // 2
+
         os.makedirs(os.path.join(self.base_exp_dir, 'distance_fields'), exist_ok=True)
-        np.savez_compressed(os.path.join(self.base_exp_dir, 'distance_fields', f'sdf_{resolution}.npz'), sdf=df[MID, :, :])
-        
         # visualize middle cut of distance field
         import matplotlib.pyplot as plt
         # add colorbar
@@ -381,8 +381,6 @@ class Runner:
         plt.colorbar(plt.imshow(df_surface[MID, :, :]), extend="both")
         plt.savefig(os.path.join(self.base_exp_dir, 'distance_fields', '{:0>8d}_surface.png'.format(self.iter_step)))
         plt.clf()
-        
-        print("lalalalalalalallaalllaa")
 
         print("cut min:", df[MID, :, :].min(), "cut max", df[MID, :, :].max())
 
@@ -398,7 +396,7 @@ class Runner:
             lambda pts: self.sdf_network.sdf(pts),
             resolution,
             threshold,
-            query_func_optim=lambda pts: self.sdf_network.sdf(pts),
+            query_func_optim=lambda pts: torch.abs(self.sdf_network.sdf(pts)),
             bound_min=bound_min,
             bound_max=bound_max,
             laplacian_weight=500.0,
