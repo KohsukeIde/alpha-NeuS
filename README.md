@@ -28,13 +28,13 @@ Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/l
 
 ## Acknowledgements & Citation
 
-- [alpha-NeuS](https://lingjie0206.github.io/papers/NeuS/)
+- [alpha-NeuS](https://github.com/728388808/alpha-NeuS)
 
 ```bibtex
-@inproceedings{wang2021neus,
+@inproceedings{alpha-neus,
 	title={From Transparent to Opaque: Rethinking Neural Implicit Surfaces with α-NeuS},
 	author={Zhang,Haoran and Deng,Junkai and Chen,Xvhui and Hou,Fei},
-	booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+	booktitle={Proceedings of the Neural Information Processing Systems (NeurIPS)},
 	year={2024}
 }
 ```
