@@ -25,6 +25,32 @@ The data is organized as follows:
 
 Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/lioryariv/idr/blob/main/DATA_CONVENTION.md), where `world_mat_xx` denotes the world to image projection matrix, and `scale_mat_xx` denotes the normalization matrix.
 
+## Training
+For synthetic scene
+```sh
+bash train_synthetic.sh
+```
+For real-world scene
+```sh
+bash train_real.sh
+```
+
+Or, you can train it step by step as follows:
+1. train NeuS
+```sh
+python exp_runner.py --mode train --conf ${config_name} --case ${data_dirname}
+```
+2. validate mesh of NeuS
+```sh
+python exp_runner.py --is_continue --mode validate_mesh --conf ${config_name} --case ${data_dirname} --mcube_threshold -0.0
+```
+3. validate mesh by using dcudf
+```sh
+python exp_runner.py --is_continue --mode validate_dcudf --conf ${config_name} --case ${data_dirname} --mcube_threshold 0.005
+```
+
+
+
 
 ## Acknowledgements & Citation
 
