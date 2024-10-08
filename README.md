@@ -24,3 +24,31 @@ The data is organized as follows:
 ```
 
 Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/lioryariv/idr/blob/main/DATA_CONVENTION.md), where `world_mat_xx` denotes the world to image projection matrix, and `scale_mat_xx` denotes the normalization matrix.
+
+
+## Acknowledgements & Citation
+```
+- [alpha-NeuS](https://lingjie0206.github.io/papers/NeuS/)
+
+```bibtex
+@inproceedings{wang2021neus,
+	title={From Transparent to Opaque: Rethinking Neural Implicit Surfaces with α-NeuS},
+	author={Zhang,Haoran and Deng,Junkai and Chen,Xvhui and Hou,Fei},
+	booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+	year={2024}
+}
+```
+
+```
+- [NeuS](https://lingjie0206.github.io/papers/NeuS/)
+
+```bibtex
+@inproceedings{wang2021neus,
+	title={NeuS: Learning Neural Implicit Surfaces by Volume Rendering for Multi-view Reconstruction},
+	author={Wang, Peng and Liu, Lingjie and Liu, Yuan and Theobalt, Christian and Komura, Taku and Wang, Wenping},
+	booktitle={Proc. Advances in Neural Information Processing Systems (NeurIPS)},
+	volume={34},
+	pages={27171--27183},
+	year={2021}
+}
+```
