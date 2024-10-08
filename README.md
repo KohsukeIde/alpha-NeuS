@@ -53,28 +53,14 @@ python exp_runner.py --is_continue --mode validate_dcudf --conf ${config_name} -
 
 
 ## Acknowledgements & Citation
+This work is built upon the foundation of [NeuS](https://github.com/totoro97/NeuS) and [DoubleCoverUDF](https://github.com/jjjkkyz/DCUDF). We offer our most sincere thanks to their outstanding work.
 
-- [alpha-NeuS](https://github.com/728388808/alpha-NeuS)
-
+If you find our work useful, please feel free to cite us.
 ```bibtex
-@inproceedings{alpha-neus,
-	title={From Transparent to Opaque: Rethinking Neural Implicit Surfaces with α-NeuS},
-	author={Zhang,Haoran and Deng,Junkai and Chen,Xvhui and Hou,Fei},
+@inproceedings{zhang2024from,
+	title={From Transparent to Opaque: Rethinking Neural Implicit Surfaces with $\alpha$-NeuS},
+	author={Zhang, Haoran and Deng, Junkai and Chen, Xuhui and Hou, Fei and Wang, Wencheng and Qin, Hong and Qian, Chen and He, Ying},
 	booktitle={Proceedings of the Neural Information Processing Systems (NeurIPS)},
 	year={2024}
-}
-```
-
-
-- [NeuS](https://lingjie0206.github.io/papers/NeuS/)
-
-```bibtex
-@inproceedings{wang2021neus,
-	title={NeuS: Learning Neural Implicit Surfaces by Volume Rendering for Multi-view Reconstruction},
-	author={Wang, Peng and Liu, Lingjie and Liu, Yuan and Theobalt, Christian and Komura, Taku and Wang, Wenping},
-	booktitle={Proc. Advances in Neural Information Processing Systems (NeurIPS)},
-	volume={34},
-	pages={27171--27183},
-	year={2021}
 }
 ```
