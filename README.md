@@ -27,7 +27,7 @@ Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/l
 
 
 ## Acknowledgements & Citation
-```
+
 - [alpha-NeuS](https://lingjie0206.github.io/papers/NeuS/)
 
 ```bibtex
@@ -39,7 +39,7 @@ Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/l
 }
 ```
 
-```
+
 - [NeuS](https://lingjie0206.github.io/papers/NeuS/)
 
 ```bibtex
