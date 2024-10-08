@@ -1,7 +1,8 @@
 # alpha-NeuS
 
-Code and data for alpha-neus(nips2024)
-## [Project page](https://github.com/728388808/alpha-NeuS/) |  [Paper](https://arxiv.org/abs/2106.10689) | [Data](https://www.dropbox.com/sh/w0y8bbdmxzik3uk/AAAaZffBiJevxQzRskoOYcyja?dl=0)
+This paper introduces α-NeuS, a new method for simultaneously reconstructing thin transparent objects and opaque objects based on neural implicit surfaces (NeuS). 
+
+## [Paper](https://arxiv.org/abs/2106.10689) | [Data](https://www.dropbox.com/scl/fi/q8by01z58c0c6ioba4zq5/data.zip?rlkey=t29d79z51c679ztjvspd8t0pf&st=88igep20&dl=0)
 This is the official repo for the implementation of **From Transparent to Opaque: Rethinking Neural Implicit Surfaces with α-NeuS**.
 
 ## Usage
