@@ -14,11 +14,11 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
     Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(N)
     Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(N)
     
-    alpha, beta , gamma = 65, 0, 30
+    alpha, beta , gamma = 0, 0, 0
     rot_matrix = trimesh.transformations.rotation_matrix((alpha/180)*np.pi, [1,0,0], [0,0,0])
     rot_matrix = trimesh.transformations.rotation_matrix((beta/180)*np.pi, [0,1,0], [0,0,0]) @ rot_matrix
     rot_matrix = trimesh.transformations.rotation_matrix((gamma/180)*np.pi, [0,0,1], [0,0,0]) @ rot_matrix   
-    print(rot_matrix)
+    #print(rot_matrix)
 
     u = np.zeros([resolution, resolution, resolution], dtype=np.float32)
     with torch.no_grad():
@@ -27,7 +27,7 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
                 for zi, zs in enumerate(Z):
                     xx, yy, zz = torch.meshgrid(xs, ys, zs)
                     pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1)
-                    pts = pts @ torch.tensor(rot_matrix[:3, :3].T, dtype=torch.float32).to(pts.device)
+                    #pts = pts @ torch.tensor(rot_matrix[:3, :3].T, dtype=torch.float32).to(pts.device)
                     val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy()
                     u[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = val
     return u
