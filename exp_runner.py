@@ -178,7 +178,6 @@ class Runner:
 
             if self.iter_step % self.val_mesh_freq == 0:
                 self.validate_mesh()
-                self.validate_distance_field()
 
             self.update_learning_rate()
 
@@ -353,40 +352,6 @@ class Runner:
 
         logging.info('End')
 
-    def validate_distance_field(self, resolution=64, scale=1.0):
-        MID = resolution // 2
-        
-        bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)/scale
-        bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)/scale
-        df = self.renderer.extract_fields(bound_min, bound_max, resolution=resolution)
-        #np.savez_compressed(os.path.join(self.base_exp_dir, 'distance_fields', 'sdf_512.npz'), sdf=df[MID, :, :])
-        df_surface = abs(df)
-        df_surface[df > 0.2] = 0.2
-
-        #MID = resolution // 2
-
-        os.makedirs(os.path.join(self.base_exp_dir, 'distance_fields'), exist_ok=True)
-        # visualize middle cut of distance field
-        import matplotlib.pyplot as plt
-        # add colorbar
-        plt.colorbar(plt.imshow(df[MID, :, :]), extend="both")
-        plt.savefig(os.path.join(self.base_exp_dir, 'distance_fields', '{:0>8d}.png'.format(self.iter_step)))
-        # clear the current plot
-        plt.clf()
-        # create contour plot
-        plt.colorbar(plt.contourf(df[MID, :, :], levels=50), extend="both")
-        plt.savefig(os.path.join(self.base_exp_dir, 'distance_fields', '{:0>8d}_contour.png'.format(self.iter_step)))
-        plt.clf()
-        # create surface plot
-        plt.colorbar(plt.imshow(df_surface[MID, :, :]), extend="both")
-        plt.savefig(os.path.join(self.base_exp_dir, 'distance_fields', '{:0>8d}_surface.png'.format(self.iter_step)))
-        plt.clf()
-
-        print("cut min:", df[MID, :, :].min(), "cut max", df[MID, :, :].max())
-
-        logging.info('End')
-
-
     def validate_dcudf(self, world_space=False, resolution=64, threshold=0.0, is_cut=False, scale=1.0):
         from dcudf.mesh_extraction import dcudf
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)/scale
@@ -410,75 +375,6 @@ class Runner:
         mesh = trimesh.Trimesh(vertices, mesh.faces)
         mesh.export(os.path.join(self.base_exp_dir, 'udf_meshes', '{:0>8d}.ply'.format(self.iter_step)))
 
-        logging.info('End')
-
-    def validate_ray(self, idx=-1, x=0, y=0):
-        if idx < 0:
-            idx = np.random.randint(self.dataset.n_images)
-        
-        print('Validate ray: iter: {}, camera: {}'.format(self.iter_step, idx))
-        rays_o, rays_d = self.dataset.gen_rays_xy_at(idx, torch.Tensor([x]), torch.Tensor([y]))
-        rays_o = rays_o.reshape(-1, 3)
-        rays_d = rays_d.reshape(-1, 3)
-        near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
-        background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
-
-        render_out = self.renderer.render(rays_o, rays_d, near, far, background_rgb=background_rgb)
-        dump = render_out['dump']
-        for k in dump.keys():
-            if isinstance(dump[k], torch.Tensor):
-                dump[k] = dump[k].tolist()
-        import json
-        # create output directory
-        os.makedirs(os.path.join(self.base_exp_dir, 'rays'), exist_ok=True)
-        for ray_idx in range(0, 1):
-            with open(os.path.join(self.base_exp_dir, 'rays', '{:0>8d}_{}_x{}_y{}.json'.format(self.iter_step, idx, x, y)), 'w') as f:
-                json.dump(dump, f)
-            # visualize the ray
-            from matplotlib import pyplot as plt
-            from matplotlib.collections import LineCollection
-            from matplotlib.colors import LinearSegmentedColormap
-            from matplotlib.gridspec import GridSpec
-            # set up the figure and axis
-            fig = plt.figure(layout="constrained")
-            gs = GridSpec(2, 2, figure=fig)
-
-            # right top: visualize the color along the ray
-            # build colormap
-            cmapl = dump['sampled_color'][ray_idx] # we only have one ray
-            cmapll = []
-            for c in cmapl:
-                # data is read in BGR color model by opencv, and the neural network is trained to match the BGR color.
-                # matplotlib color map uses RGB color model, so we need to convert the color model.
-                cmapll.append((c[2], c[1], c[0]))
-            cmap = LinearSegmentedColormap.from_list("ray_color", cmapll)
-            points = np.array([dump['mid_z_vals'][ray_idx], dump['weights_foreground'][ray_idx]]).T.reshape(-1, 1, 2)
-            segments = np.concatenate([points[:-1], points[1:]], axis=1)
-            lc = LineCollection(segments, cmap=cmap, linewidth=1)
-            lc.set_array(dump['mid_z_vals'][ray_idx])
-            ax1 = fig.add_subplot(gs[0, 1])
-            ax1.add_collection(lc)
-            ax1.autoscale()
-
-            # right bottom: visualize the distance values along the ray
-            ax2 = fig.add_subplot(gs[1, 1])
-            ax2.plot(dump['mid_z_vals'][ray_idx], dump['sdf'][ray_idx])
-            # set axes aspect equal
-            ax2.set_aspect('equal', adjustable='box')
-
-            # left: visualize the original image
-            ax3 = fig.add_subplot(gs[:, 0])
-            # again, we should load image and convert from GBR to RGB
-            img = self.dataset.image_at(idx, resolution_level=4)
-            img = cv.cvtColor(img, cv.COLOR_BGR2RGB)
-            ax3.imshow(img)
-            ax3.plot(x // 4, y // 4, 'ro', markersize=2)
-
-            # save the figure
-            plt.savefig(os.path.join(self.base_exp_dir, 'rays', '{:0>8d}_{}_x{}_y{}.png'.format(self.iter_step, idx, x, y)), format='png')
-            plt.savefig(os.path.join(self.base_exp_dir, 'rays', '{:0>8d}_{}_x{}_y{}.svg'.format(self.iter_step, idx, x, y)), format='svg')
-            plt.clf()
-        
         logging.info('End')
 
     def interpolate_view(self, img_idx_0, img_idx_1):
@@ -524,8 +420,6 @@ if __name__ == '__main__':
     parser.add_argument('--case', type=str, default='')
     parser.add_argument('--ckpt', type=int, default=None)
     parser.add_argument('--scale', type=float, default=1.0)
-    parser.add_argument('--x', type=int, default=0)
-    parser.add_argument('--y', type=int, default=0)
     parser.add_argument('--idx', type=int, default=-1)
 
     args = parser.parse_args()
@@ -541,10 +435,6 @@ if __name__ == '__main__':
         runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold, scale=args.scale)
     elif args.mode == 'validate_dcudf':
         runner.validate_dcudf(world_space=True, resolution=512, threshold=args.mcube_threshold, is_cut=False, scale=args.scale)
-    elif args.mode == 'validate_distance_field':
-        runner.validate_distance_field(resolution=512, scale=args.scale)
-    elif args.mode == 'validate_ray':
-        runner.validate_ray(idx=args.idx, x=args.x, y=args.y)
     elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
         _, img_idx_0, img_idx_1 = args.mode.split('_')
         img_idx_0 = int(img_idx_0)

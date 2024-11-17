@@ -5,7 +5,6 @@ import numpy as np
 import logging
 import mcubes
 from icecream import ic
-import trimesh
 
 
 def extract_fields(bound_min, bound_max, resolution, query_func):
@@ -13,12 +12,6 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(N)
     Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(N)
     Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(N)
-    
-    alpha, beta , gamma = 0, 0, 0
-    rot_matrix = trimesh.transformations.rotation_matrix((alpha/180)*np.pi, [1,0,0], [0,0,0])
-    rot_matrix = trimesh.transformations.rotation_matrix((beta/180)*np.pi, [0,1,0], [0,0,0]) @ rot_matrix
-    rot_matrix = trimesh.transformations.rotation_matrix((gamma/180)*np.pi, [0,0,1], [0,0,0]) @ rot_matrix   
-    #print(rot_matrix)
 
     u = np.zeros([resolution, resolution, resolution], dtype=np.float32)
     with torch.no_grad():
@@ -27,7 +20,6 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
                 for zi, zs in enumerate(Z):
                     xx, yy, zz = torch.meshgrid(xs, ys, zs)
                     pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1)
-                    #pts = pts @ torch.tensor(rot_matrix[:3, :3].T, dtype=torch.float32).to(pts.device)
                     val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy()
                     u[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = val
     return u
@@ -214,14 +206,11 @@ class NeuSRenderer:
                     background_rgb=None,
                     cos_anneal_ratio=0.0):
         batch_size, n_samples = z_vals.shape
-        dump = {}
 
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = torch.cat([dists, torch.Tensor([sample_dist]).expand(dists[..., :1].shape)], -1)
         mid_z_vals = z_vals + dists * 0.5
-
-        dump['mid_z_vals'] = mid_z_vals.detach().cpu()
 
         # Section midpoints
         pts = rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]  # n_rays, n_samples, 3
@@ -234,12 +223,8 @@ class NeuSRenderer:
         sdf = sdf_nn_output[:, :1]
         feature_vector = sdf_nn_output[:, 1:]
 
-        dump['sdf'] = sdf.reshape(batch_size, n_samples).detach().cpu()
-
         gradients = sdf_network.gradient(pts).squeeze()
         sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
-
-        dump['sampled_color'] = sampled_color.detach().cpu()
 
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
@@ -265,7 +250,6 @@ class NeuSRenderer:
 
         ## EXPERIMENTAL: Use HF-NeuS formula
         cdf = torch.sigmoid(sdf * inv_s)
-        # iter_cos = -1.0 # EXP2
         e = inv_s * (1 - cdf) * (iter_cos).abs() * self.trans_threshold * dists.reshape(-1, 1)
         alpha = (1 - torch.exp(-e)).reshape(batch_size, n_samples).clip(0.0, 1.0)
 
@@ -283,12 +267,6 @@ class NeuSRenderer:
 
         weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
         weights_sum = weights.sum(dim=-1, keepdim=True)
-
-        dump['weights_foreground'] = weights[:, :n_samples].detach().cpu()
-        dump['weights_background'] = weights[:, n_samples:].detach().cpu()
-        dump['weights_sum_foreground'] = weights[:, :n_samples].sum(dim=-1, keepdim=True).detach().cpu()
-        dump['weights_sum_background'] = weights[:, n_samples:].sum(dim=-1, keepdim=True).detach().cpu()
-        dump['weights_sum'] = weights_sum.sum(dim=-1, keepdim=True).detach().cpu()
 
         color = (sampled_color * weights[:, :, None]).sum(dim=1)
         if background_rgb is not None:    # Fixed background, usually black
@@ -315,7 +293,6 @@ class NeuSRenderer:
             'gradient_error': gradient_error,
             'inside_sphere': inside_sphere,
             'iso_loss': iso_loss,
-            'dump': dump,
         }
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
@@ -411,7 +388,6 @@ class NeuSRenderer:
             'gradient_error': ret_fine['gradient_error'],
             'inside_sphere': ret_fine['inside_sphere'],
             'iso_loss': ret_fine['iso_loss'],
-            'dump': ret_fine['dump'],
         }
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
