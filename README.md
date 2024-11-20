@@ -25,6 +25,11 @@ The data is organized as follows:
 
 Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/lioryariv/idr/blob/main/DATA_CONVENTION.md), where `world_mat_xx` denotes the world to image projection matrix, and `scale_mat_xx` denotes the normalization matrix.
 
+#### Environment
+Set up the environment as specified in NeuS.
+
+
+
 ## Training
 For synthetic scene
 ```sh
