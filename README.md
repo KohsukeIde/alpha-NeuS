@@ -28,6 +28,11 @@ Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/l
 #### Environment
 Set up the environment as specified in NeuS.
 
+```sh
+bash wget "https://dl.dropboxusercontent.com/scl/fi/q8by01z58c0c6ioba4zq5/data.zip?rlkey=t29d79z51c679ztjvspd8t0pf" -O data.zip
+unzip data.zip
+```
+
 
 
 ## Training

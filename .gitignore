@@ -1,0 +1,6 @@
+# Ignore data and cache
+data/
+data.zip
+exp/
+models/__pycache__/
+__pycache__/
