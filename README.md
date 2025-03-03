@@ -25,6 +25,8 @@ The data is organized as follows:
 
 Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/lioryariv/idr/blob/main/DATA_CONVENTION.md), where `world_mat_xx` denotes the world to image projection matrix, and `scale_mat_xx` denotes the normalization matrix.
 
+use the following link to download code to convert colmap to npz https://github.com/wutong16/Voxurf/issues/11#issuecomment-1494710756
+
 #### Environment
 Set up the environment as specified in NeuS.
 
