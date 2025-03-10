@@ -31,7 +31,7 @@ use the following link to download code to convert colmap to npz https://github.
 Set up the environment as specified in NeuS.
 
 ```sh
-bash wget "https://dl.dropboxusercontent.com/scl/fi/q8by01z58c0c6ioba4zq5/data.zip?rlkey=t29d79z51c679ztjvspd8t0pf" -O data.zip
+wget "https://dl.dropboxusercontent.com/scl/fi/q8by01z58c0c6ioba4zq5/data.zip?rlkey=t29d79z51c679ztjvspd8t0pf" -O data.zip
 unzip data.zip
 ```
 
