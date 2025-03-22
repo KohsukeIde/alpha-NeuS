@@ -9,6 +9,7 @@ from scipy.spatial.transform import Slerp
 import logging
 from PIL import Image
 import gc
+import re
 
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
@@ -48,31 +49,6 @@ def sample_image_as_numpy(torch_img, resolution_level):
     return numpy_img
 
 
-# 代替の読み込み方法を追加
-def safe_read_image(path):
-    """OpenCVとPILの両方を試して画像を読み込む"""
-    # まずOpenCVで試す
-    img = cv.imread(path)
-    if img is not None:
-        return img
-    
-    # OpenCVが失敗したらPILで試す
-    try:
-        pil_img = Image.open(path)
-        # PIL -> NumPy -> OpenCV形式に変換
-        img = np.array(pil_img)
-        if len(img.shape) == 2:  # グレースケール
-            img = cv.cvtColor(img, cv.COLOR_GRAY2BGR)
-        elif img.shape[2] == 4:  # RGBA
-            img = cv.cvtColor(img, cv.COLOR_RGBA2BGR)
-        elif img.shape[2] == 3:  # RGB
-            img = cv.cvtColor(img, cv.COLOR_RGB2BGR)
-        return img
-    except Exception as e:
-        logging.warning(f"PILでも読み込めませんでした: {path}, エラー: {e}")
-        return None
-
-
 class Dataset:
     def __init__(self, conf):
         super(Dataset, self).__init__()
@@ -97,6 +73,24 @@ class Dataset:
         camera_dict = np.load(camera_path)
         self.camera_dict = camera_dict
         
+        # 利用可能なカメラインデックスをソートして保持
+        self.available_camera_indices = []
+        for key in camera_dict.keys():
+            if key.startswith('world_mat_'):
+                try:
+                    idx = int(key.split('_')[-1])
+                    self.available_camera_indices.append(idx)
+                except:
+                    pass
+                    
+        # カメラインデックスをソート
+        self.available_camera_indices.sort()
+        
+        if not self.available_camera_indices:
+            raise RuntimeError("No camera matrices found in the camera file!")
+            
+        logging.info(f"Found {len(self.available_camera_indices)} camera matrices")
+        
         # 画像パスの取得
         self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
         if len(self.images_lis) == 0:
@@ -116,63 +110,56 @@ class Dataset:
         if len(self.masks_lis) == 0:
             raise FileNotFoundError(f"No mask files found in {os.path.join(self.data_dir, 'mask/')}")
         
-        # データローダー方式に変更：最初の画像だけロードして寸法を取得
-        sample_image_path = self.images_lis[0]
-        sample_mask_path = self.masks_lis[0]
-        
-        if not os.path.exists(sample_image_path):
-            raise FileNotFoundError(f"Sample image not found: {sample_image_path}")
-            
-        sample_img = safe_read_image(sample_image_path)
-        if sample_img is None:
-            raise IOError(f"Failed to load sample image: {sample_image_path}")
-        
-        if not os.path.exists(sample_mask_path):
-            raise FileNotFoundError(f"Sample mask not found: {sample_mask_path}")
-        
-        sample_mask = safe_read_image(sample_mask_path)
-        if sample_mask is None:
-            raise IOError(f"Failed to load sample mask: {sample_mask_path}")
-        
-        # 画像のサイズを記録（後で使用）
-        self.img_h, self.img_w = sample_img.shape[:2]
-        logging.info(f"Image dimensions: {self.img_w}x{self.img_h}")
-        
-        # 問題のある画像インデックスをキャッシュするセット
-        self.bad_image_indices = set()
-        
-        # LRU画像キャッシュ（最大20枚までメモリに保持）
-        self.image_cache = {}
-        self.mask_cache = {}
-        self.max_cache_size = 20
-        
-        # 画像をテストロード（無効な画像をチェック）
+        # 有効な画像パスとマスクパスを保持する配列
         valid_images_lis = []
         valid_masks_lis = []
+        self.world_mats_np = []
+        self.scale_mats_np = []
+        
+        # 画像をテストロードして有効なものだけを保持
+        camera_idx = 0  # カメラインデックスのカウンタ
         
         for i, (img_path, mask_path) in enumerate(zip(self.images_lis, self.masks_lis)):
             try:
                 # 存在チェックと読み込みテスト
-                if os.path.exists(img_path) and os.path.exists(mask_path):
-                    img = safe_read_image(img_path)
-                    if img is None:
-                        logging.warning(f"Failed to load image, skipping: {img_path}")
-                        self.bad_image_indices.add(i)
-                        continue
-                        
-                    msk = safe_read_image(mask_path)
-                    if msk is None:
-                        logging.warning(f"Failed to load mask, skipping: {mask_path}")
-                        self.bad_image_indices.add(i)
-                        continue
+                if not os.path.exists(img_path) or not os.path.exists(mask_path):
+                    logging.warning(f"Image or mask file not found, excluding: {img_path} or {mask_path}")
+                    continue
                     
-                    valid_images_lis.append(img_path)
-                    valid_masks_lis.append(mask_path)
-                else:
-                    self.bad_image_indices.add(i)
-                    logging.warning(f"Image or mask file not found, skipping: {img_path} or {mask_path}")
+                img = cv.imread(img_path)
+                if img is None:
+                    logging.warning(f"Failed to load image, excluding: {img_path}")
+                    continue
+                    
+                msk = cv.imread(mask_path)
+                if msk is None:
+                    logging.warning(f"Failed to load mask, excluding: {mask_path}")
+                    continue
+                
+                # 利用可能なカメラインデックスをチェック
+                if camera_idx >= len(self.available_camera_indices):
+                    logging.warning(f"No more available camera matrices, excluding: {img_path}")
+                    break
+                
+                # 現在のカメラインデックスを取得
+                current_camera_idx = self.available_camera_indices[camera_idx]
+                
+                # カメラ行列の存在確認
+                if f'world_mat_{current_camera_idx}' not in camera_dict or f'scale_mat_{current_camera_idx}' not in camera_dict:
+                    logging.warning(f"Camera matrix {current_camera_idx} not found, skipping to next")
+                    camera_idx += 1
+                    continue
+                
+                # 有効な画像・マスクパスとカメラ行列を追加
+                valid_images_lis.append(img_path)
+                valid_masks_lis.append(mask_path)
+                self.world_mats_np.append(camera_dict[f'world_mat_{current_camera_idx}'].astype(np.float32))
+                self.scale_mats_np.append(camera_dict[f'scale_mat_{current_camera_idx}'].astype(np.float32))
+                
+                # 次のカメラインデックスへ
+                camera_idx += 1
+                
             except Exception as e:
-                self.bad_image_indices.add(i)
                 logging.error(f"Error checking image at index {i}: {e}")
         
         # 有効な画像リストに更新
@@ -185,43 +172,18 @@ class Dataset:
             
         logging.info(f"Found {self.n_images} valid image-mask pairs out of {orig_n_images}")
         
-        if self.n_images < orig_n_images:
-            logging.warning(f"Only {self.n_images} out of {orig_n_images} images were loaded successfully. Skipped {orig_n_images - self.n_images} images.")
+        # 初期サンプル画像を読み込んで寸法を取得
+        if self.n_images > 0:
+            sample_img = cv.imread(self.images_lis[0])
+            self.img_h, self.img_w = sample_img.shape[:2]
+            logging.info(f"Image dimensions: {self.img_w}x{self.img_h}")
+        else:
+            raise RuntimeError("No valid images to process!")
         
-        # 初期化時に必要な属性を設定
-        self.world_mats_np = []
-        self.scale_mats_np = []
-        
-        # カメラ行列を収集（有効な画像のみ）
-        for i in range(self.n_images):
-            # カメラ行列のキーが存在するか確認
-            img_idx = int(os.path.basename(self.images_lis[i]).split('.')[0])  # ファイル名から元のインデックスを取得
-            if f'world_mat_{img_idx}' not in camera_dict or f'scale_mat_{img_idx}' not in camera_dict:
-                logging.warning(f"Camera matrix for image {i} (idx: {img_idx}) not found, using first camera instead")
-                # 最初のカメラ行列を代用
-                if i > 0 and len(self.world_mats_np) > 0:
-                    self.world_mats_np.append(self.world_mats_np[0].copy())
-                    self.scale_mats_np.append(self.scale_mats_np[0].copy())
-                else:
-                    # 一つも有効なカメラがない場合
-                    fallback_idx = 0
-                    while f'world_mat_{fallback_idx}' not in camera_dict or f'scale_mat_{fallback_idx}' not in camera_dict:
-                        fallback_idx += 1
-                        if fallback_idx >= 1000:  # 安全対策
-                            raise RuntimeError("No valid camera matrices found!")
-                    
-                    self.world_mats_np.append(camera_dict[f'world_mat_{fallback_idx}'].astype(np.float32))
-                    self.scale_mats_np.append(camera_dict[f'scale_mat_{fallback_idx}'].astype(np.float32))
-            else:
-                self.world_mats_np.append(camera_dict[f'world_mat_{img_idx}'].astype(np.float32))
-                self.scale_mats_np.append(camera_dict[f'scale_mat_{img_idx}'].astype(np.float32))
-        
-        # 有効な画像数を確認
-        if self.n_images != len(self.world_mats_np):
-            logging.error(f"Mismatch between number of valid images ({self.n_images}) and camera matrices ({len(self.world_mats_np)})")
-            raise RuntimeError("Number of valid images doesn't match number of camera matrices!")
-            
-        logging.info(f"Final number of usable images: {self.n_images}")
+        # LRU画像キャッシュ（最大20枚までメモリに保持）
+        self.image_cache = {}
+        self.mask_cache = {}
+        self.max_cache_size = 100
 
         self.intrinsics_all = []
         self.pose_all = []
@@ -258,18 +220,51 @@ class Dataset:
         print('Load data: End')
         logging.info(f"Successfully prepared dataset with {self.n_images} valid images.")
         
+        # 背景画像の読み込み
+        self.bkgds_lis = sorted(glob(os.path.join(self.data_dir, 'background/*.png')))
+        if len(self.bkgds_lis) == 0:
+            self.bkgds_lis = sorted(glob(os.path.join(self.data_dir, 'background/*.jpg')))
+        
+        # 元のNeUSと同様に背景画像を直接ロード（GPUに直接ロード）
+        self.bkgds = []
+        for im_name in self.bkgds_lis:
+            bkgd_img = cv.imread(im_name)
+            if bkgd_img is not None:
+                # テンソル変換して直接GPU上に配置
+                bkgd_tensor = torch.from_numpy(bkgd_img.astype(np.float32) / 256.0).to(self.device)
+                self.bkgds.append(bkgd_tensor)
+            else:
+                # 読み込みに失敗した場合は黒画像
+                self.bkgds.append(torch.zeros((self.H, self.W, 3), device=self.device))
+                logging.warning(f"Failed to load background image: {im_name}, using black image")
+        
+        # デバッグ出力：背景画像とカメラIDの対応関係を表示
+        print(f"DEBUG: Loaded {len(self.bkgds)} background images")
+        for i, bkgd_path in enumerate(self.bkgds_lis):
+            print(f"DEBUG: Background[{i}] = {os.path.basename(bkgd_path)}")
+            
+        # 各画像ファイルとカメラIDの対応関係を表示
+        print("\nDEBUG: Image-Camera ID mapping:")
+        for i in range(min(20, self.n_images)):  # 最大20個まで表示
+            filename = os.path.basename(self.images_lis[i])
+            camera_id = int(filename[1])
+            print(f"DEBUG: Image[{i}] = {filename}, Camera ID = {camera_id}")
+        if self.n_images > 20:
+            print(f"DEBUG: ... and {self.n_images - 20} more images")
+            
+        # 画像数と背景画像数の不一致警告
+        unique_camera_ids = set([int(os.path.basename(fname)[1]) for fname in self.images_lis])
+        if len(unique_camera_ids) != len(self.bkgds):
+            print(f"WARNING: Number of unique camera IDs ({len(unique_camera_ids)}) does not match number of background images ({len(self.bkgds)})")
+            print(f"DEBUG: Unique camera IDs: {sorted(list(unique_camera_ids))}")
+        
         # メモリクリーンアップ
         gc.collect()
 
     def _get_image(self, idx):
         """インデックスから画像を取得（キャッシュ機能付き）"""
-        if idx in self.bad_image_indices:
-            # 問題のある画像は別のランダムな画像で代替
-            logging.warning(f"Attempting to load known bad image at index {idx}, using random replacement")
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices:
-                raise RuntimeError("No valid images available!")
-            idx = np.random.choice(valid_indices)
+        if idx >= self.n_images:
+            raise IndexError(f"Image index {idx} out of range (0-{self.n_images-1})")
             
         # キャッシュをチェック
         if idx in self.image_cache:
@@ -278,9 +273,8 @@ class Dataset:
         # キャッシュになければ読み込む
         try:
             image_path = self.images_lis[idx]
-            img = safe_read_image(image_path)
+            img = cv.imread(image_path)
             if img is None:
-                self.bad_image_indices.add(idx)
                 raise IOError(f"Failed to load image: {image_path}")
                 
             tensor_img = torch.from_numpy(img.astype(np.float32) / 256.0)
@@ -295,23 +289,13 @@ class Dataset:
             return tensor_img
             
         except Exception as e:
-            self.bad_image_indices.add(idx)
             logging.error(f"Error loading image at index {idx}: {e}")
-            # エラーが発生した場合は別の画像を試す
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices:
-                raise RuntimeError("No valid images available!")
-            return self._get_image(np.random.choice(valid_indices))
+            raise  # エラーを上位に伝播
 
     def _get_mask(self, idx):
         """インデックスからマスクを取得（キャッシュ機能付き）"""
-        if idx in self.bad_image_indices:
-            # 問題のある画像は別のランダムな画像で代替
-            logging.warning(f"Attempting to load known bad mask at index {idx}, using random replacement")
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices:
-                raise RuntimeError("No valid masks available!")
-            idx = np.random.choice(valid_indices)
+        if idx >= self.n_images:
+            raise IndexError(f"Mask index {idx} out of range (0-{self.n_images-1})")
             
         # キャッシュをチェック
         if idx in self.mask_cache:
@@ -320,9 +304,8 @@ class Dataset:
         # キャッシュになければ読み込む
         try:
             mask_path = self.masks_lis[idx]
-            msk = safe_read_image(mask_path)
+            msk = cv.imread(mask_path)
             if msk is None:
-                self.bad_image_indices.add(idx)
                 raise IOError(f"Failed to load mask: {mask_path}")
                 
             tensor_mask = torch.from_numpy(msk.astype(np.float32) / 256.0)
@@ -337,35 +320,22 @@ class Dataset:
             return tensor_mask
             
         except Exception as e:
-            self.bad_image_indices.add(idx)
             logging.error(f"Error loading mask at index {idx}: {e}")
-            # エラーが発生した場合は別の画像を試す
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices:
-                raise RuntimeError("No valid masks available!")
-            return self._get_mask(np.random.choice(valid_indices))
+            raise  # エラーを上位に伝播
 
     def clear_cache(self):
         """キャッシュをクリアしてメモリを解放"""
         self.image_cache.clear()
         self.mask_cache.clear()
         gc.collect()
-        logging.info("Image and mask cache cleared")
+        logging.info("All caches cleared")
             
     def gen_rays_at(self, img_idx, resolution_level=1):
         """
         Generate rays at world space from one camera.
         """
         if img_idx >= self.n_images:
-            logging.warning(f"Image index {img_idx} out of range, using index 0 instead.")
-            img_idx = 0
-            
-        if img_idx in self.bad_image_indices:
-            # 問題のある画像の場合は別の画像を使用
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices:
-                raise RuntimeError("No valid images available!")
-            img_idx = np.random.choice(valid_indices)
+            raise IndexError(f"Image index {img_idx} out of range (0-{self.n_images-1})")
             
         l = resolution_level
         tx = torch.linspace(0, self.W - 1, self.W // l)
@@ -383,15 +353,12 @@ class Dataset:
         Generate random rays at world space from one camera.
         """
         if img_idx >= self.n_images:
-            logging.warning(f"Image index {img_idx} out of range, using random index instead.")
-            img_idx = np.random.randint(0, self.n_images)
-            
-        if img_idx in self.bad_image_indices:
-            # 問題のある画像の場合は別の画像を使用
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices:
-                raise RuntimeError("No valid images available!")
-            img_idx = np.random.choice(valid_indices)
+            raise IndexError(f"Image index {img_idx} out of range (0-{self.n_images-1})")
+        
+        # カメラIDとファイル名をデバッグ出力
+        camera_id = self.camera_id_at(img_idx)
+        filename = os.path.basename(self.images_lis[img_idx])
+        print(f"DEBUG: gen_random_rays_at img_idx={img_idx}, filename={filename}, camera_id={camera_id}")
             
         pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
@@ -401,7 +368,8 @@ class Dataset:
         mask = self._get_mask(img_idx).to(self.device)
         
         color = image[(pixels_y, pixels_x)]    # batch_size, 3
-        mask_value = mask[(pixels_y, pixels_x)][:, :1]  # batch_size, 1 (マスクは1チャネルのみ使用)
+        mask_value = mask[(pixels_y, pixels_x)]      # batch_size, 3
+        mask_value = mask_value[:, :1]  # 最初のチャンネルだけを使用
         
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
@@ -413,7 +381,7 @@ class Dataset:
         del image
         del mask
         
-        return torch.cat([rays_o, rays_v, color, mask_value], dim=-1)    # batch_size, 10
+        return torch.cat([rays_o, rays_v, color, mask_value], dim=-1).cuda()    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
@@ -421,16 +389,7 @@ class Dataset:
         """
         # インデックスの範囲チェック
         if idx_0 >= self.n_images or idx_1 >= self.n_images:
-            logging.warning(f"Image indices {idx_0}, {idx_1} out of range, using 0 and 1 instead.")
-            idx_0 = 0
-            idx_1 = min(1, self.n_images-1)
-            
-        if idx_0 in self.bad_image_indices or idx_1 in self.bad_image_indices:
-            # 問題のある画像の場合は別の画像を使用
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices or len(valid_indices) < 2:
-                raise RuntimeError("Not enough valid images available!")
-            idx_0, idx_1 = np.random.choice(valid_indices, 2, replace=False)
+            raise IndexError(f"Image indices {idx_0}, {idx_1} out of range (0-{self.n_images-1})")
             
         l = resolution_level
         tx = torch.linspace(0, self.W - 1, self.W // l)
@@ -472,35 +431,113 @@ class Dataset:
     def image_at(self, idx, resolution_level):
         """解像度を落として画像を返す"""
         if idx >= self.n_images:
-            logging.warning(f"Image index {idx} out of range, using index 0 instead.")
-            idx = 0
-            
-        if idx in self.bad_image_indices:
-            # 問題のある画像の場合は別の画像を使用
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices:
-                raise RuntimeError("No valid images available!")
-            idx = np.random.choice(valid_indices)
+            raise IndexError(f"Image index {idx} out of range (0-{self.n_images-1})")
         
         image_path = self.images_lis[idx]
         try:
-            img = safe_read_image(image_path)
+            img = cv.imread(image_path)
             if img is None:
-                self.bad_image_indices.add(idx)
-                # エラーが発生した場合は別の画像を試す
-                valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-                if not valid_indices:
-                    raise RuntimeError("No valid images available!")
-                return self.image_at(np.random.choice(valid_indices), resolution_level)
+                raise IOError(f"Failed to load image: {image_path}")
         except Exception as e:
-            self.bad_image_indices.add(idx)
             logging.error(f"Error loading image: {image_path}, {e}")
-            # エラーが発生した場合は別の画像を試す
-            valid_indices = [i for i in range(self.n_images) if i not in self.bad_image_indices]
-            if not valid_indices:
-                # エラーが発生した場合は、黒い画像を返す
-                img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
-            else:
-                return self.image_at(np.random.choice(valid_indices), resolution_level)
+            raise
             
         return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
+
+    def camera_id_at(self, img_idx):
+        """画像インデックスから背景用のカメラIDを返す（元のNeUSと同じ方式）"""
+        if img_idx >= self.n_images:
+            raise IndexError(f"Image index {img_idx} out of range (0-{self.n_images-1})")
+        
+        # 元のNeUSの実装と同様の単純な方法
+        # ファイル名の2文字目（[1]）をカメラIDとして使用
+        filename = os.path.basename(self.images_lis[img_idx])
+        camera_id = int(filename[1])
+        
+        # デバッグ出力（カメラIDの確認）
+        print(f"DEBUG: img_idx={img_idx}, filename={filename}, camera_id={camera_id}")
+        
+        # カメラIDがbkgdsの範囲内かチェック
+        if camera_id >= len(self.bkgds):
+            print(f"WARNING: Camera ID {camera_id} from filename {filename} is out of range (0-{len(self.bkgds)-1})")
+        
+        return camera_id
+
+    def sample_rays_at(self, img_idx, resolution_level=1):
+        """
+        Sample pixels from one camera.
+        """
+        if img_idx >= self.n_images:
+            raise IndexError(f"Image index {img_idx} out of range (0-{self.n_images-1})")
+            
+        # 解像度レベルに応じて線形空間を作成
+        l = resolution_level
+        
+        # 画像をロード
+        try:
+            img = self._get_image(img_idx).to(self.device)
+        except Exception as e:
+            logging.error(f"Error loading image in sample_rays_at: {e}")
+            raise
+        
+        # 画像サイズに基づいてピクセル座標を生成
+        tx = torch.linspace(0, img.shape[1] - 1, img.shape[1] // l)
+        ty = torch.linspace(0, img.shape[0] - 1, img.shape[0] // l)
+        pixels_x, pixels_y = torch.meshgrid(tx, ty, indexing='ij')
+        pixels_x = pixels_x.to(torch.int64).transpose(0, 1)
+        pixels_y = pixels_y.to(torch.int64).transpose(0, 1)
+
+        # カメラ空間のレイを生成
+        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float().to(self.device) # H, W, 3
+        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze(-1)  # H, W, 3
+        rays_camera = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # H, W, 3
+            
+        return rays_camera, pixels_x, pixels_y
+
+    def gen_background_pixels_at(self, camera_idx, resolution_level=1):
+        """背景画像からピクセル座標を生成"""
+        # 背景画像を取得
+        camera_id = self.camera_id_at(camera_idx)
+        
+        if camera_id < len(self.bkgds):
+            bkgd = self.bkgds[camera_id]
+        else:
+            # カメラIDに対応する背景がない場合
+            bkgd = torch.zeros((self.H, self.W, 3))
+            
+        l = resolution_level
+        tx = torch.linspace(0, bkgd.shape[1] - 1, bkgd.shape[1] // l)
+        ty = torch.linspace(0, bkgd.shape[0] - 1, bkgd.shape[0] // l)
+        pixels_x, pixels_y = torch.meshgrid(tx, ty, indexing='ij')
+        pixels_x = pixels_x.to(torch.int64)
+        pixels_y = pixels_y.to(torch.int64)
+        return pixels_x.transpose(0, 1), pixels_y.transpose(0, 1)
+
+    def bkgd_at(self, idx, resolution_level):
+        """特定のインデックスの背景画像を取得 (元のNeUS方式)"""
+        if idx >= self.n_images:
+            raise IndexError(f"Image index {idx} out of range (0-{self.n_images-1})")
+            
+        camera_id = self.camera_id_at(idx)
+        filename = os.path.basename(self.images_lis[idx])
+        print(f"DEBUG: bkgd_at() idx={idx}, filename={filename}, camera_id={camera_id}, bkgds_len={len(self.bkgds)}")
+        
+        # 背景画像の範囲チェック
+        if camera_id >= len(self.bkgds):
+            # エラーではなく黒画像を返す
+            print(f"WARNING: Camera ID {camera_id} exceeds available backgrounds, using black image")
+            return np.zeros((self.H // resolution_level, self.W // resolution_level, 3))
+        
+        # 背景画像を取得
+        bkgd = self.bkgds[camera_id]
+        print(f"DEBUG: Using background image for camera_id={camera_id}, shape={bkgd.shape}")
+        
+        # ROIデータの処理
+        if hasattr(self, 'is_roi_data') and self.is_roi_data:
+            bkgd = bkgd[
+                self.roi_tops[idx]: self.roi_bottoms[idx],
+                self.roi_lefts[idx]: self.roi_rights[idx]
+                ]
+                
+        # リサイズして返す
+        return sample_image_as_numpy(bkgd, resolution_level)

@@ -3,12 +3,13 @@ import torch.nn.functional as F
 import cv2 as cv
 import numpy as np
 import os
-import re
 from glob import glob
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
 import logging
+from PIL import Image
 import gc
+import re
 
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
@@ -48,26 +49,6 @@ def sample_image_as_numpy(torch_img, resolution_level):
     return numpy_img
 
 
-# ファイル名からインデックスを抽出する関数
-def extract_idx_from_filename(filename):
-    """ファイル名からカメラ番号と画像インデックスを抽出する"""
-    # ファイル名のみを取得（パスとファイル拡張子を除去）
-    basename = os.path.basename(filename)
-    name_without_ext = os.path.splitext(basename)[0]
-    
-    # 6桁のパターン: 最初の2桁がカメラ番号、最後の4桁が画像インデックス
-    if len(name_without_ext) == 6 and name_without_ext.isdigit():
-        camera_id = int(name_without_ext[:2])
-        return camera_id
-    
-    # 従来のフォールバック処理
-    numbers = re.findall(r'\d+', name_without_ext)
-    if len(numbers) > 0:
-        return int(numbers[0])  # 最初の数字をカメラIDとして返す
-    else:
-        return 0  # デフォルト値
-
-
 class Dataset:
     def __init__(self, conf):
         super(Dataset, self).__init__()
@@ -101,8 +82,9 @@ class Dataset:
                     self.available_camera_indices.append(idx)
                 except:
                     pass
-        
-        self.available_camera_indices.sort()  # インデックスをソート
+                    
+        # カメラインデックスをソート
+        self.available_camera_indices.sort()
         
         if not self.available_camera_indices:
             raise RuntimeError("No camera matrices found in the camera file!")
@@ -127,18 +109,10 @@ class Dataset:
             
         if len(self.masks_lis) == 0:
             raise FileNotFoundError(f"No mask files found in {os.path.join(self.data_dir, 'mask/')}")
-            
-        # 背景画像の読み込み
-        self.bkgds_lis = sorted(glob(os.path.join(self.data_dir, 'background/*.png')))
-        if len(self.bkgds_lis) == 0:
-            self.bkgds_lis = sorted(glob(os.path.join(self.data_dir, 'background/*.jpg')))
         
         # 有効な画像パスとマスクパスを保持する配列
         valid_images_lis = []
         valid_masks_lis = []
-        self.images = []
-        self.masks = []
-        self.bkgds = []
         self.world_mats_np = []
         self.scale_mats_np = []
         self.file_index_to_camera_index = {}  # 背景画像用のマッピング
@@ -180,19 +154,11 @@ class Dataset:
                 # 有効な画像・マスクパスとカメラ行列を追加
                 valid_images_lis.append(img_path)
                 valid_masks_lis.append(mask_path)
-                
-                # 有効な画像データをCPUに保持（GPUではなく）
-                self.images.append(torch.from_numpy(img).cpu())
-                self.masks.append(torch.from_numpy(msk).cpu())
-                
-                # カメラ行列を追加
                 self.world_mats_np.append(camera_dict[f'world_mat_{current_camera_idx}'].astype(np.float32))
                 self.scale_mats_np.append(camera_dict[f'scale_mat_{current_camera_idx}'].astype(np.float32))
                 
-                # 背景画像用に画像ファイル名からカメラIDを抽出してマッピング
-                # この情報は背景画像のロード時にのみ使用
-                extracted_camera_id = extract_idx_from_filename(img_path)
-                self.file_index_to_camera_index[len(valid_images_lis) - 1] = extracted_camera_id
+                # 背景画像用にファイル名から抽出したカメラIDをマッピング
+                self.file_index_to_camera_index[len(valid_images_lis) - 1] = int(os.path.basename(img_path)[1])
                 
                 # 次のカメラインデックスへ
                 camera_idx += 1
@@ -210,13 +176,18 @@ class Dataset:
             
         logging.info(f"Found {self.n_images} valid image-mask pairs out of {orig_n_images}")
         
-        # 画像サイズを取得
+        # 初期サンプル画像を読み込んで寸法を取得
         if self.n_images > 0:
-            self.H, self.W = self.images[0].shape[0], self.images[0].shape[1]
-            logging.info(f"Image dimensions: {self.W}x{self.H}")
-            self.image_pixels = self.H * self.W
+            sample_img = cv.imread(self.images_lis[0])
+            self.img_h, self.img_w = sample_img.shape[:2]
+            logging.info(f"Image dimensions: {self.img_w}x{self.img_h}")
         else:
-            raise RuntimeError("No valid images found!")
+            raise RuntimeError("No valid images to process!")
+        
+        # LRU画像キャッシュ（最大20枚までメモリに保持）
+        self.image_cache = {}
+        self.mask_cache = {}
+        self.max_cache_size = 20
 
         self.intrinsics_all = []
         self.pose_all = []
@@ -232,6 +203,10 @@ class Dataset:
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
         self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
+        
+        # サンプル画像の寸法を使用
+        self.H, self.W = self.img_h, self.img_w
+        self.image_pixels = self.H * self.W
 
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
@@ -249,44 +224,86 @@ class Dataset:
         print('Load data: End')
         logging.info(f"Successfully prepared dataset with {self.n_images} valid images.")
         
-        # オプショナル: メモリ解放のためCPUから完全に削除するメソッド
-        self.is_images_dropped = False
+        # 背景画像の読み込み
+        self.bkgds_lis = sorted(glob(os.path.join(self.data_dir, 'background/*.png')))
+        if len(self.bkgds_lis) == 0:
+            self.bkgds_lis = sorted(glob(os.path.join(self.data_dir, 'background/*.jpg')))
         
-        # 背景画像の読み込み（対応するカメラIDのみ保持）
-        self.bkgds = []
-        for i in range(self.n_images):
-            camera_id = self.file_index_to_camera_index.get(i, 0)  # デフォルトは0
-            try:
-                if camera_id < len(self.bkgds_lis):
-                    bkgd_path = self.bkgds_lis[camera_id]
-                    if os.path.exists(bkgd_path):
-                        bkgd = cv.imread(bkgd_path)
-                        if bkgd is not None:
-                            self.bkgds.append(torch.from_numpy(bkgd).cpu())
-                            continue
-                # 上記の条件に合わない場合は黒背景を追加
-                self.bkgds.append(torch.zeros((self.H, self.W, 3)).cpu())
-            except Exception as e:
-                logging.error(f"Error loading background image for camera {camera_id}: {e}")
-                self.bkgds.append(torch.zeros((self.H, self.W, 3)).cpu())
+        # 背景画像もLRUキャッシュ方式で管理
+        self.bkgd_cache = {}
         
-    def drop_images_and_masks(self):
-        """メモリ節約のために画像とマスクデータをメモリから削除"""
-        self.is_images_dropped = True
-        i = self.images
-        self.images = []
-        del i
-
-        m = self.masks
-        self.masks = []
-        del m
-        
-        b = self.bkgds
-        self.bkgds = []
-        del b
-        
+        # メモリクリーンアップ
         gc.collect()
 
+    def _get_image(self, idx):
+        """インデックスから画像を取得（キャッシュ機能付き）"""
+        if idx >= self.n_images:
+            raise IndexError(f"Image index {idx} out of range (0-{self.n_images-1})")
+            
+        # キャッシュをチェック
+        if idx in self.image_cache:
+            return self.image_cache[idx]
+        
+        # キャッシュになければ読み込む
+        try:
+            image_path = self.images_lis[idx]
+            img = cv.imread(image_path)
+            if img is None:
+                raise IOError(f"Failed to load image: {image_path}")
+                
+            tensor_img = torch.from_numpy(img.astype(np.float32) / 256.0)
+            
+            # キャッシュが最大サイズを超えたら、最も古いアイテムを削除
+            if len(self.image_cache) >= self.max_cache_size:
+                oldest_key = next(iter(self.image_cache))
+                del self.image_cache[oldest_key]
+                
+            # キャッシュに追加
+            self.image_cache[idx] = tensor_img
+            return tensor_img
+            
+        except Exception as e:
+            logging.error(f"Error loading image at index {idx}: {e}")
+            raise  # エラーを上位に伝播
+
+    def _get_mask(self, idx):
+        """インデックスからマスクを取得（キャッシュ機能付き）"""
+        if idx >= self.n_images:
+            raise IndexError(f"Mask index {idx} out of range (0-{self.n_images-1})")
+            
+        # キャッシュをチェック
+        if idx in self.mask_cache:
+            return self.mask_cache[idx]
+        
+        # キャッシュになければ読み込む
+        try:
+            mask_path = self.masks_lis[idx]
+            msk = cv.imread(mask_path)
+            if msk is None:
+                raise IOError(f"Failed to load mask: {mask_path}")
+                
+            tensor_mask = torch.from_numpy(msk.astype(np.float32) / 256.0)
+            
+            # キャッシュが最大サイズを超えたら、最も古いアイテムを削除
+            if len(self.mask_cache) >= self.max_cache_size:
+                oldest_key = next(iter(self.mask_cache))
+                del self.mask_cache[oldest_key]
+                
+            # キャッシュに追加
+            self.mask_cache[idx] = tensor_mask
+            return tensor_mask
+            
+        except Exception as e:
+            logging.error(f"Error loading mask at index {idx}: {e}")
+            raise  # エラーを上位に伝播
+
+    def clear_cache(self):
+        """キャッシュをクリアしてメモリを解放"""
+        self.image_cache.clear()
+        self.mask_cache.clear()
+        gc.collect()
+        logging.info("Image and mask cache cleared")
+            
     def gen_rays_at(self, img_idx, resolution_level=1):
         """
         Generate rays at world space from one camera.
@@ -315,50 +332,23 @@ class Dataset:
         pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
         
-        # データが削除されている場合は再読み込みを試みる
-        if self.is_images_dropped:
-            # 画像ファイルを読み込む
-            try:
-                image_path = self.images_lis[img_idx]
-                mask_path = self.masks_lis[img_idx]
-                
-                img = cv.imread(image_path)
-                if img is None:
-                    raise IOError(f"Failed to load image: {image_path}")
-                    
-                msk = cv.imread(mask_path)
-                if msk is None:
-                    raise IOError(f"Failed to load mask: {mask_path}")
-                    
-                image = torch.from_numpy(img.astype(np.float32) / 256.0).to(self.device)
-                mask = torch.from_numpy(msk.astype(np.float32) / 256.0).to(self.device)
-                
-                color = image[(pixels_y, pixels_x)]    # batch_size, 3
-                mask_value = mask[(pixels_y, pixels_x)]      # batch_size, 3
-                mask_value = mask_value[:, :1]  # 最初のチャンネルだけを使用
-                
-                # 使用後はGPUメモリから削除
-                del image
-                del mask
-            except Exception as e:
-                logging.error(f"Error loading image for rays: {e}")
-                # エラーが発生した場合は、ダミーデータで代用
-                color = torch.zeros([batch_size, 3]).to(self.device)
-                mask_value = torch.zeros([batch_size, 1]).to(self.device)
-        else:
-            # 画像からデータを取得
-            image = self.images[img_idx].to(self.device) / 256.0
-            mask = self.masks[img_idx].to(self.device) / 256.0
-            
-            color = image[(pixels_y, pixels_x)]    # batch_size, 3
-            mask_value = mask[(pixels_y, pixels_x)]      # batch_size, 3
-            mask_value = mask_value[:, :1]  # 最初のチャンネルだけを使用
+        # 指定された画像を読み込む
+        image = self._get_image(img_idx).to(self.device)
+        mask = self._get_mask(img_idx).to(self.device)
+        
+        color = image[(pixels_y, pixels_x)]    # batch_size, 3
+        mask_value = mask[(pixels_y, pixels_x)]      # batch_size, 3
+        mask_value = mask_value[:, :1]  # 最初のチャンネルだけを使用
         
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
+        
+        # 使用後はGPUメモリから削除（必要に応じて）
+        del image
+        del mask
         
         return torch.cat([rays_o, rays_v, color, mask_value], dim=-1).cuda()    # batch_size, 10
 
@@ -407,121 +397,135 @@ class Dataset:
         far = mid + 1.0
         return near, far
 
-    def sample_rays_at(self, img_idx, resolution_level=1):
-        """
-        指定されたカメラからの光線サンプリング情報を生成します
-        """
-        if img_idx >= self.n_images:
-            raise IndexError(f"Image index {img_idx} out of range (0-{self.n_images-1})")
-            
-        l = resolution_level
-        tx = torch.linspace(0, self.W - 1, self.W // l)
-        ty = torch.linspace(0, self.H - 1, self.H // l)
-        pixels_x, pixels_y = torch.meshgrid(tx, ty)
-        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1) # W, H, 3
-        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze(-1)  # H, W, 3
-        rays_camera = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # H, W, 3
-            
-        return rays_camera, pixels_x, pixels_y
-
     def image_at(self, idx, resolution_level):
         """解像度を落として画像を返す"""
         if idx >= self.n_images:
             raise IndexError(f"Image index {idx} out of range (0-{self.n_images-1})")
         
-        # メモリから削除されている場合はファイルから読み込む
-        if self.is_images_dropped:
-            image_path = self.images_lis[idx]
-            try:
-                img = cv.imread(image_path)
-                if img is None:
-                    raise IOError(f"Failed to load image: {image_path}")
-                    
-                return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
-            except Exception as e:
-                logging.error(f"Error loading image: {image_path}, {e}")
-                raise
-        else:
-            # メモリに保持している画像からサンプリング
-            return sample_image_as_numpy(self.images[idx].to(self.device), resolution_level) * 256.0
+        image_path = self.images_lis[idx]
+        try:
+            img = cv.imread(image_path)
+            if img is None:
+                raise IOError(f"Failed to load image: {image_path}")
+        except Exception as e:
+            logging.error(f"Error loading image: {image_path}, {e}")
+            raise
+            
+        return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
 
     def camera_id_at(self, img_idx):
-        """有効なイメージインデックスから対応するカメラIDを返す"""
+        """画像インデックスから背景用のカメラIDを返す（ファイル名から抽出）"""
         if img_idx >= self.n_images:
             raise IndexError(f"Image index {img_idx} out of range (0-{self.n_images-1})")
             
-        camera_id = self.file_index_to_camera_index.get(img_idx, 0)  # デフォルトは0
-        img_path = self.images_lis[img_idx] if img_idx < len(self.images_lis) else "unknown"
-        logging.debug(f"camera_id_at({img_idx}): path={os.path.basename(img_path)}, camera_id={camera_id}")
-        return camera_id
+        return self.file_index_to_camera_index.get(img_idx, 0)  # デフォルトは0
+
+    def sample_rays_at(self, img_idx, resolution_level=1):
+        """
+        Sample pixels from one camera.
+        """
+        if img_idx >= self.n_images:
+            raise IndexError(f"Image index {img_idx} out of range (0-{self.n_images-1})")
+            
+        # 解像度レベルに応じて線形空間を作成
+        l = resolution_level
+        
+        # 画像をロード
+        try:
+            img = self._get_image(img_idx).to(self.device)
+        except Exception as e:
+            logging.error(f"Error loading image in sample_rays_at: {e}")
+            raise
+        
+        # 画像サイズに基づいてピクセル座標を生成
+        tx = torch.linspace(0, img.shape[1] - 1, img.shape[1] // l)
+        ty = torch.linspace(0, img.shape[0] - 1, img.shape[0] // l)
+        pixels_x, pixels_y = torch.meshgrid(tx, ty, indexing='ij')
+        pixels_x = pixels_x.to(torch.int64).transpose(0, 1)
+        pixels_y = pixels_y.to(torch.int64).transpose(0, 1)
+
+        # カメラ空間のレイを生成
+        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float().to(self.device) # H, W, 3
+        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze(-1)  # H, W, 3
+        rays_camera = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # H, W, 3
+            
+        return rays_camera, pixels_x, pixels_y
 
     def gen_background_pixels_at(self, camera_idx, resolution_level=1):
         """背景画像からピクセル座標を生成"""
-        # 背景画像インデックスの確認
-        if camera_idx >= self.n_images:
-            raise IndexError(f"Camera index {camera_idx} out of range (0-{self.n_images-1})")
-            
         # 背景画像を取得
-        if self.is_images_dropped or camera_idx >= len(self.bkgds):
-            # 失われたデータの場合はデフォルトのサイズを使用
-            bkgd_shape = (self.H, self.W)
+        camera_id = self.camera_id_at(camera_idx)
+        
+        if camera_id < len(self.bkgds_lis):
+            if camera_id in self.bkgd_cache:
+                bkgd = self.bkgd_cache[camera_id]
+            else:
+                try:
+                    bkgd_path = self.bkgds_lis[camera_id]
+                    bkgd_img = cv.imread(bkgd_path)
+                    if bkgd_img is None:
+                        # 黒い背景を返す
+                        bkgd_img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+                    bkgd = torch.from_numpy(bkgd_img).float() / 256.0
+                    
+                    # キャッシュが一定サイズを超えたら古いものを削除
+                    if len(self.bkgd_cache) >= self.max_cache_size:
+                        oldest_key = next(iter(self.bkgd_cache))
+                        del self.bkgd_cache[oldest_key]
+                    
+                    self.bkgd_cache[camera_id] = bkgd
+                    
+                except Exception as e:
+                    logging.error(f"Error loading background image: {e}")
+                    bkgd = torch.zeros((self.H, self.W, 3))
         else:
-            # 背景画像がある場合、その形状を使用
-            bkgd_shape = self.bkgds[camera_idx].shape
+            # カメラIDに対応する背景がない場合
+            bkgd = torch.zeros((self.H, self.W, 3))
             
         l = resolution_level
-        tx = torch.linspace(0, bkgd_shape[1] - 1, bkgd_shape[1] // l)
-        ty = torch.linspace(0, bkgd_shape[0] - 1, bkgd_shape[0] // l)
+        tx = torch.linspace(0, bkgd.shape[1] - 1, bkgd.shape[1] // l)
+        ty = torch.linspace(0, bkgd.shape[0] - 1, bkgd.shape[0] // l)
         pixels_x, pixels_y = torch.meshgrid(tx, ty, indexing='ij')
         pixels_x = pixels_x.to(torch.int64)
         pixels_y = pixels_y.to(torch.int64)
         return pixels_x.transpose(0, 1), pixels_y.transpose(0, 1)
 
-    def bkgd_at(self, idx, resolution_level=1):
+    def bkgd_at(self, idx, resolution_level):
         """特定のインデックスの背景画像を取得"""
         if idx >= self.n_images:
             raise IndexError(f"Image index {idx} out of range (0-{self.n_images-1})")
             
         camera_id = self.camera_id_at(idx)
-        logging.debug(f"bkgd_at({idx}): Camera ID = {camera_id}")
         
-        # 背景画像の取得
-        if self.is_images_dropped:
-            # メモリから削除されている場合はファイルから読み込む
-            if camera_id < len(self.bkgds_lis):
+        # 背景画像を取得
+        if camera_id in self.bkgd_cache:
+            bkgd = self.bkgd_cache[camera_id].to(self.device)
+        elif camera_id < len(self.bkgds_lis):
+            try:
                 bkgd_path = self.bkgds_lis[camera_id]
-                logging.debug(f"bkgd_at({idx}): Loading from file {os.path.basename(bkgd_path)}")
-                if not os.path.exists(bkgd_path):
-                    raise IOError(f"Background file does not exist: {bkgd_path}")
-                    
                 bkgd_img = cv.imread(bkgd_path)
                 if bkgd_img is None:
-                    raise IOError(f"Failed to load background image: {bkgd_path}")
-                    
-                logging.debug(f"bkgd_at({idx}): Original background image shape {bkgd_img.shape}")
-                # 背景画像のサイズを元の画像サイズにリサイズ
-                if bkgd_img.shape[0] != self.H or bkgd_img.shape[1] != self.W:
-                    logging.info(f"bkgd_at({idx}): Resizing background from {bkgd_img.shape[:2]} to {(self.H, self.W)}")
-                    bkgd_img = cv.resize(bkgd_img, (self.W, self.H), interpolation=cv.INTER_AREA)
+                    # 黒い背景を返す
+                    bkgd_img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
                 bkgd = torch.from_numpy(bkgd_img).float().to(self.device) / 256.0
-            else:
-                # カメラIDに対応する背景がない場合
-                raise RuntimeError(f"bkgd_at({idx}): Camera ID {camera_id} exceeds background list length {len(self.bkgds_lis)}")
-        elif idx < len(self.bkgds):
-            # メモリに保持している背景画像を使用
-            logging.debug(f"bkgd_at({idx}): Using cached background for camera ID {camera_id}")
-            bkgd = self.bkgds[idx].to(self.device) / 256.0
+                
+                # キャッシュが一定サイズを超えたら古いものを削除
+                if len(self.bkgd_cache) >= self.max_cache_size:
+                    oldest_key = next(iter(self.bkgd_cache))
+                    del self.bkgd_cache[oldest_key]
+                
+                self.bkgd_cache[camera_id] = bkgd.cpu()
+                
+            except Exception as e:
+                logging.error(f"Error loading background image: {e}")
+                bkgd = torch.zeros((self.H, self.W, 3)).to(self.device)
         else:
             # カメラIDに対応する背景がない場合
-            raise RuntimeError(f"bkgd_at({idx}): Image index {idx} exceeds background list length {len(self.bkgds)}")
-                
-        # ROIデータの場合は切り出し
+            bkgd = torch.zeros((self.H, self.W, 3)).to(self.device)
+        
         if hasattr(self, 'is_roi_data') and self.is_roi_data:
             bkgd = bkgd[
                 self.roi_tops[idx]: self.roi_bottoms[idx],
                 self.roi_lefts[idx]: self.roi_rights[idx]
                 ]
-        
-        result = sample_image_as_numpy(bkgd, resolution_level)
-        logging.debug(f"bkgd_at({idx}): Returning background shape {result.shape}")
-        return result
+        return sample_image_as_numpy(bkgd, resolution_level)

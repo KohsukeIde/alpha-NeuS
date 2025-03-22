@@ -80,7 +80,8 @@ class NeuSRenderer:
                  n_outside,
                  up_sample_steps,
                  perturb,
-                 trans_threshold):
+                 trans_threshold=0.01,
+                 use_hf_sampling=False):
         self.nerf = nerf
         self.sdf_network = sdf_network
         self.deviation_network = deviation_network
@@ -91,6 +92,8 @@ class NeuSRenderer:
         self.up_sample_steps = up_sample_steps
         self.perturb = perturb
         self.trans_threshold = trans_threshold
+        self.use_hf_sampling = use_hf_sampling
+        self.iso_weight = 0.0  # Can be set externally
 
     def render_core_outside(self, rays_o, rays_d, z_vals, sample_dist, nerf, background_rgb=None):
         """
@@ -100,7 +103,7 @@ class NeuSRenderer:
 
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.Tensor([sample_dist]).expand(dists[..., :1].shape)], -1)
+        dists = torch.cat([dists, torch.tensor([sample_dist], device=rays_o.device).expand(dists[..., :1].shape)], -1)
         mid_z_vals = z_vals + dists * 0.5
 
         # Section midpoints
@@ -118,7 +121,7 @@ class NeuSRenderer:
         sampled_color = torch.sigmoid(sampled_color)
         alpha = 1.0 - torch.exp(-F.softplus(density.reshape(batch_size, n_samples)) * dists)
         alpha = alpha.reshape(batch_size, n_samples)
-        weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
+        weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1], device=rays_o.device), 1. - alpha + 1e-7], -1), -1)[:, :-1]
         sampled_color = sampled_color.reshape(batch_size, n_samples, 3)
         color = (weights[:, :, None] * sampled_color).sum(dim=1)
         if background_rgb is not None:
@@ -160,7 +163,7 @@ class NeuSRenderer:
         # |     \/
         # |
         # ----------------------------------------------------------------------------------------------------------
-        prev_cos_val = torch.cat([torch.zeros([batch_size, 1]), cos_val[:, :-1]], dim=-1)
+        prev_cos_val = torch.cat([torch.zeros([batch_size, 1], device=rays_o.device), cos_val[:, :-1]], dim=-1)
         cos_val = torch.stack([prev_cos_val, cos_val], dim=-1)
         cos_val, _ = torch.min(cos_val, dim=-1, keepdim=False)
         cos_val = cos_val.clip(-1e3, 0.0) * inside_sphere
@@ -172,7 +175,7 @@ class NeuSRenderer:
         next_cdf = torch.sigmoid(next_esti_sdf * inv_s)
         alpha = (prev_cdf - next_cdf + 1e-5) / (prev_cdf + 1e-5)
         weights = alpha * torch.cumprod(
-            torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
+            torch.cat([torch.ones([batch_size, 1], device=rays_o.device), 1. - alpha + 1e-7], -1), -1)[:, :-1]
 
         z_samples = sample_pdf(z_vals, weights, n_importance, det=True).detach()
         return z_samples
@@ -187,7 +190,7 @@ class NeuSRenderer:
         if not last:
             new_sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, n_importance)
             sdf = torch.cat([sdf, new_sdf], dim=-1)
-            xx = torch.arange(batch_size)[:, None].expand(batch_size, n_samples + n_importance).reshape(-1)
+            xx = torch.arange(batch_size, device=rays_o.device)[:, None].expand(batch_size, n_samples + n_importance).reshape(-1)
             index = index.reshape(-1)
             sdf = sdf[(xx, index)].reshape(batch_size, n_samples + n_importance)
 
@@ -209,7 +212,7 @@ class NeuSRenderer:
 
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.Tensor([sample_dist]).expand(dists[..., :1].shape)], -1)
+        dists = torch.cat([dists, torch.tensor([sample_dist], device=rays_o.device).expand(dists[..., :1].shape)], -1)
         mid_z_vals = z_vals + dists * 0.5
 
         # Section midpoints
@@ -222,11 +225,10 @@ class NeuSRenderer:
         sdf_nn_output = sdf_network(pts)
         sdf = sdf_nn_output[:, :1]
         feature_vector = sdf_nn_output[:, 1:]
-
         gradients = sdf_network.gradient(pts).squeeze()
         sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
 
-        inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
+        inv_s = deviation_network(torch.zeros([1, 3], device=rays_o.device))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
 
         true_cos = (dirs * gradients).sum(-1, keepdim=True)
@@ -237,21 +239,24 @@ class NeuSRenderer:
                      F.relu(-true_cos) * cos_anneal_ratio)  # always non-positive
 
         # Estimate signed distances at section points
-        """estimated_next_sdf = sdf + iter_cos * dists.reshape(-1, 1) * 0.5
-        estimated_prev_sdf = sdf - iter_cos * dists.reshape(-1, 1) * 0.5
+        if not self.use_hf_sampling:
+            # Original NeuS alpha formula
+            estimated_next_sdf = sdf + iter_cos * dists.reshape(-1, 1) * 0.5
+            estimated_prev_sdf = sdf - iter_cos * dists.reshape(-1, 1) * 0.5
 
-        prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
-        next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+            prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+            next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
 
-        p = prev_cdf - next_cdf
-        c = prev_cdf
+            p = prev_cdf - next_cdf
+            c = prev_cdf
 
-        alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)"""
-
-        ## EXPERIMENTAL: Use HF-NeuS formula
-        cdf = torch.sigmoid(sdf * inv_s)
-        e = inv_s * (1 - cdf) * (iter_cos).abs() * self.trans_threshold * dists.reshape(-1, 1)
-        alpha = (1 - torch.exp(-e)).reshape(batch_size, n_samples).clip(0.0, 1.0)
+            alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
+            cdf = c.reshape(batch_size, n_samples)
+        else:
+            # HF-NeuS alpha formula
+            cdf = torch.sigmoid(sdf * inv_s)
+            e = inv_s * (1 - cdf) * (iter_cos).abs() * self.trans_threshold * dists.reshape(-1, 1)
+            alpha = (1 - torch.exp(-e)).reshape(batch_size, n_samples).clip(0.0, 1.0)
 
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
         inside_sphere = (pts_norm < 1.0).float().detach()
@@ -265,7 +270,7 @@ class NeuSRenderer:
                             background_sampled_color[:, :n_samples] * (1.0 - inside_sphere)[:, :, None]
             sampled_color = torch.cat([sampled_color, background_sampled_color[:, n_samples:]], dim=1)
 
-        weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
+        weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1], device=rays_o.device), 1. - alpha + 1e-7], -1), -1)[:, :-1]
         weights_sum = weights.sum(dim=-1, keepdim=True)
 
         color = (sampled_color * weights[:, :, None]).sum(dim=1)
@@ -277,9 +282,11 @@ class NeuSRenderer:
                                             dim=-1) - 1.0) ** 2
         gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
         
-        # iso loss
-        alpha = 25000
-        iso_loss = torch.exp(-abs(sdf) * alpha).sum()/batch_size # batch_size = ray_o.shape[0] = 512
+        # Optional iso surface regularization loss
+        iso_loss = torch.zeros([1], device=rays_o.device)
+        if hasattr(self, "iso_weight") and self.iso_weight > 0:
+            alpha = 25000
+            iso_loss = torch.exp(-abs(sdf) * alpha).sum() / batch_size
         
         return {
             'color': color,
@@ -289,7 +296,7 @@ class NeuSRenderer:
             's_val': 1.0 / inv_s,
             'mid_z_vals': mid_z_vals,
             'weights': weights,
-            'cdf': cdf.reshape(batch_size, n_samples), # 'cdf': c.reshape(batch_size, n_samples),
+            'cdf': cdf,
             'gradient_error': gradient_error,
             'inside_sphere': inside_sphere,
             'iso_loss': iso_loss,
@@ -298,12 +305,12 @@ class NeuSRenderer:
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
         batch_size = len(rays_o)
         sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
-        z_vals = torch.linspace(0.0, 1.0, self.n_samples)
+        z_vals = torch.linspace(0.0, 1.0, self.n_samples, device=rays_o.device)
         z_vals = near + (far - near) * z_vals[None, :]
 
         z_vals_outside = None
-        if self.n_outside > 0:
-            z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
+        if self.n_outside > 0 and self.nerf is not None:
+            z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside, device=rays_o.device)
 
         n_samples = self.n_samples
         perturb = self.perturb
@@ -311,17 +318,17 @@ class NeuSRenderer:
         if perturb_overwrite >= 0:
             perturb = perturb_overwrite
         if perturb > 0:
-            t_rand = (torch.rand([batch_size, 1]) - 0.5)
+            t_rand = (torch.rand([batch_size, 1], device=rays_o.device) - 0.5)
             z_vals = z_vals + t_rand * 2.0 / self.n_samples
 
-            if self.n_outside > 0:
+            if self.n_outside > 0 and self.nerf is not None:
                 mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
                 upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
                 lower = torch.cat([z_vals_outside[..., :1], mids], -1)
-                t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
+                t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]], device=rays_o.device)
                 z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
 
-        if self.n_outside > 0:
+        if self.n_outside > 0 and self.nerf is not None:
             z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
 
         background_alpha = None
@@ -350,7 +357,7 @@ class NeuSRenderer:
             n_samples = self.n_samples + self.n_importance
 
         # Background model
-        if self.n_outside > 0:
+        if self.n_outside > 0 and self.nerf is not None:
             z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
             z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
             ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
@@ -377,7 +384,7 @@ class NeuSRenderer:
         gradients = ret_fine['gradients']
         s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
 
-        return {
+        result_dict = {
             'color_fine': color_fine,
             's_val': s_val,
             'cdf_fine': ret_fine['cdf'],
@@ -387,8 +394,10 @@ class NeuSRenderer:
             'weights': weights,
             'gradient_error': ret_fine['gradient_error'],
             'inside_sphere': ret_fine['inside_sphere'],
-            'iso_loss': ret_fine['iso_loss'],
+            'iso_loss': ret_fine['iso_loss']
         }
+        
+        return result_dict
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
         return extract_geometry(bound_min,
@@ -396,6 +405,3 @@ class NeuSRenderer:
                                 resolution=resolution,
                                 threshold=threshold,
                                 query_func=lambda pts: -self.sdf_network.sdf(pts))
-
-    def extract_fields(self, bound_min, bound_max, resolution):
-        return extract_fields(bound_min, bound_max, resolution, query_func=lambda pts: self.sdf_network.sdf(pts))

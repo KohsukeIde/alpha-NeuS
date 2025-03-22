@@ -263,3 +263,52 @@ class SingleVarianceNetwork(nn.Module):
 
     def forward(self, x):
         return torch.ones([len(x), 1]) * torch.exp(self.variance * 10.0)
+
+
+# Added MLP class for background modeling
+class MLP(nn.Module):
+    def __init__(self,
+                 d_in,
+                 d_out,
+                 d_hidden,
+                 n_layers,
+                 skips=[],
+                 multires=0,
+                 use_batchnorm=False):
+        super(MLP, self).__init__()
+        self.skips = skips
+        self.embed_fn = None
+        self.use_batchnorm = use_batchnorm
+
+        if multires > 0:
+            embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
+            self.embed_fn = embed_fn
+            d_in = input_ch
+
+        layers = []
+        layers.append(nn.Linear(d_in, d_hidden))
+        for i in range(n_layers - 1):
+            if i + 1 in self.skips:
+                layers.append(nn.Linear(d_in + d_hidden, d_hidden))
+            else:
+                layers.append(nn.Linear(d_hidden, d_hidden))
+        layers.append(nn.Linear(d_hidden, d_out))
+        self.linears = nn.ModuleList(layers)
+
+        if self.use_batchnorm:
+            self.batchnorms = nn.ModuleList([nn.BatchNorm1d(d_hidden) for _ in range(n_layers)])
+
+    def forward(self, inputs):
+        if self.embed_fn is not None:
+            inputs = self.embed_fn(inputs)
+
+        h = inputs
+        for i in range(len(self.linears)):
+            if i in self.skips:
+                h = torch.cat([inputs, h], -1)
+            h = self.linears[i](h)
+            if i < len(self.linears) - 1:
+                h = F.relu(h)
+                if self.use_batchnorm:
+                    h = self.batchnorms[i](h)
+        return h
