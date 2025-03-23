@@ -225,6 +225,7 @@ class NeuSRenderer:
         sdf_nn_output = sdf_network(pts)
         sdf = sdf_nn_output[:, :1]
         feature_vector = sdf_nn_output[:, 1:]
+
         gradients = sdf_network.gradient(pts).squeeze()
         sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
 
@@ -253,7 +254,7 @@ class NeuSRenderer:
             alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
             cdf = c.reshape(batch_size, n_samples)
         else:
-            # HF-NeuS alpha formula
+            # HF-NeuS alpha formula - 透明物体向け改良版
             cdf = torch.sigmoid(sdf * inv_s)
             e = inv_s * (1 - cdf) * (iter_cos).abs() * self.trans_threshold * dists.reshape(-1, 1)
             alpha = (1 - torch.exp(-e)).reshape(batch_size, n_samples).clip(0.0, 1.0)
@@ -267,7 +268,7 @@ class NeuSRenderer:
             alpha = alpha * inside_sphere + background_alpha[:, :n_samples] * (1.0 - inside_sphere)
             alpha = torch.cat([alpha, background_alpha[:, n_samples:]], dim=-1)
             sampled_color = sampled_color * inside_sphere[:, :, None] +\
-                            background_sampled_color[:, :n_samples] * (1.0 - inside_sphere)[:, :, None]
+                          background_sampled_color[:, :n_samples] * (1.0 - inside_sphere)[:, :, None]
             sampled_color = torch.cat([sampled_color, background_sampled_color[:, n_samples:]], dim=1)
 
         weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1], device=rays_o.device), 1. - alpha + 1e-7], -1), -1)[:, :-1]
@@ -279,7 +280,7 @@ class NeuSRenderer:
 
         # Eikonal loss
         gradient_error = (torch.linalg.norm(gradients.reshape(batch_size, n_samples, 3), ord=2,
-                                            dim=-1) - 1.0) ** 2
+                                          dim=-1) - 1.0) ** 2
         gradient_error = (relax_inside_sphere * gradient_error).sum() / (relax_inside_sphere.sum() + 1e-5)
         
         # Optional iso surface regularization loss
@@ -401,7 +402,7 @@ class NeuSRenderer:
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
         return extract_geometry(bound_min,
-                                bound_max,
-                                resolution=resolution,
-                                threshold=threshold,
-                                query_func=lambda pts: -self.sdf_network.sdf(pts))
+                              bound_max,
+                              resolution=resolution,
+                              threshold=threshold,
+                              query_func=lambda pts: -self.sdf_network.sdf(pts))

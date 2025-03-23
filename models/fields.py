@@ -68,7 +68,6 @@ class SDFNetwork(nn.Module):
             setattr(self, "lin" + str(l), lin)
 
         self.activation = nn.Softplus(beta=100)
-        # self.activation = nn.ReLU()
 
     def forward(self, inputs):
         inputs = inputs * self.scale
@@ -253,7 +252,8 @@ class NeRF(nn.Module):
             rgb = self.rgb_linear(h)
             return alpha, rgb
         else:
-            assert False
+            outputs = self.output_linear(h)
+            return outputs[..., :1], outputs[..., 1:]
 
 
 class SingleVarianceNetwork(nn.Module):
@@ -262,10 +262,10 @@ class SingleVarianceNetwork(nn.Module):
         self.register_parameter('variance', nn.Parameter(torch.tensor(init_val)))
 
     def forward(self, x):
-        return torch.ones([len(x), 1]) * torch.exp(self.variance * 10.0)
+        return torch.ones([len(x), 1], device=x.device) * torch.exp(self.variance * 10.0)
 
 
-# Added MLP class for background modeling
+# 背景モデリング用のMLPクラス
 class MLP(nn.Module):
     def __init__(self,
                  d_in,
@@ -286,29 +286,43 @@ class MLP(nn.Module):
             d_in = input_ch
 
         layers = []
-        layers.append(nn.Linear(d_in, d_hidden))
-        for i in range(n_layers - 1):
-            if i + 1 in self.skips:
-                layers.append(nn.Linear(d_in + d_hidden, d_hidden))
+        dims = [d_in] + [d_hidden] * n_layers + [d_out]
+        
+        for i in range(n_layers + 1):
+            if i in self.skips:
+                layers.append(nn.Linear(dims[i] + d_in, dims[i+1]))
             else:
-                layers.append(nn.Linear(d_hidden, d_hidden))
-        layers.append(nn.Linear(d_hidden, d_out))
+                layers.append(nn.Linear(dims[i], dims[i+1]))
+                
         self.linears = nn.ModuleList(layers)
 
         if self.use_batchnorm:
             self.batchnorms = nn.ModuleList([nn.BatchNorm1d(d_hidden) for _ in range(n_layers)])
 
     def forward(self, inputs):
+        inputs_initial = inputs
+        
         if self.embed_fn is not None:
             inputs = self.embed_fn(inputs)
+            inputs_initial = inputs
 
         h = inputs
-        for i in range(len(self.linears)):
+        for i, linear in enumerate(self.linears):
             if i in self.skips:
-                h = torch.cat([inputs, h], -1)
-            h = self.linears[i](h)
+                h = torch.cat([inputs_initial, h], dim=-1)
+                
+            h = linear(h)
+            
             if i < len(self.linears) - 1:
                 h = F.relu(h)
                 if self.use_batchnorm:
                     h = self.batchnorms[i](h)
+                    
+        # 背景MLPの場合、最後のレイヤーの出力にはsigmoidを適用
+        # RGBを[0,1]に、アルファも[0,1]に正規化
+        if h.shape[-1] == 4:  # RGB + Alpha
+            h = torch.sigmoid(h)
+        elif h.shape[-1] == 3:  # RGB only
+            h = torch.sigmoid(h)
+            
         return h

@@ -46,62 +46,46 @@ class NeusBackgroundModule(torch.nn.Module):
                 self.register_parameter("bg_tensor", torch.nn.Parameter(bg_tensor))
 
     def forward(self, camera_id, pixels_x, pixels_y, init_background_rgb):
-        """背景RGBを取得（シンプルで効率的な実装）"""
-        # 固定背景モード（元のNeUSのデフォルト）
+        background_rgb = None
         if self.bkgd_mode == "fixed":
-            # カメラIDを単純に整数に変換
-            cam_id = int(camera_id.item()) if isinstance(camera_id, torch.Tensor) and camera_id.numel() == 1 else int(camera_id) if not isinstance(camera_id, torch.Tensor) else int(camera_id[0].item())
-            
-            # 背景画像を取得（既にGPU上にあるはず）
-            background_rgb = self.dataset.bkgds[cam_id][pixels_y.long(), pixels_x.long()]
-            return background_rgb
+            background_rgb = init_background_rgb
+        else:
+            if self.bkgd_mode == "mlp":
+                cidx = camera_id * torch.ones_like(pixels_x[..., None])
+                cidx = (
+                    cidx / (self.dataset.n_images - 1) * 2 - 1
+                )  # range [0, n_cameras] -> [-1, 1]
+                x = pixels_x / (self.dataset.W - 1) * 2 - 1  # range [0, W] -> [-1, 1]
+                y = pixels_y / (self.dataset.H - 1) * 2 - 1  # range [0, H] -> [-1, 1]
+                inputs = torch.cat([cidx, x, y], -1)
+                background_rgb = self.bg_mlp(inputs)
+            elif self.bkgd_mode == "mlps":
+                x = (
+                    pixels_x[:, None] / (self.dataset.W - 1) * 2 - 1
+                )  # range [0, W] -> [-1, 1]
+                y = (
+                    pixels_y[:, None] / (self.dataset.H - 1) * 2 - 1
+                )  # range [0, H] -> [-1, 1]
+                inputs = torch.cat([x, y], -1)
+                background_rgb = None
+                for i in range(len(self.bg_mlps)):
+                    bg = self.bg_mlps[i](inputs)
+                    mask = (camera_id == i).float().view(-1, 1)
+                    bg = bg * mask
+                    if background_rgb is None:
+                        background_rgb = bg
+                    else:
+                        background_rgb = background_rgb + bg
+            elif self.bkgd_mode == "tensor":
+                background_rgb = self.bg_tensor[camera_id][(pixels_y, pixels_x)]
+
+            if self.use_init_bkgd and background_rgb is not None:
+                if background_rgb.shape[-1] == 4:
+                    rgb = background_rgb[:, 0:3]
+                    a = background_rgb[:, 3:4]
+                    background_rgb = (1 - a) * init_background_rgb + a * rgb
         
-        # その他の背景モード（MLPベースなど）
-        elif self.bkgd_mode == "mlp":
-            cidx = camera_id * torch.ones_like(pixels_x[..., None])
-            cidx = (cidx / (self.dataset.n_images - 1) * 2 - 1)
-            x = pixels_x / (self.dataset.W - 1) * 2 - 1
-            y = pixels_y / (self.dataset.H - 1) * 2 - 1
-            inputs = torch.cat([cidx, x, y], -1)
-            background_rgb = self.bg_mlp(inputs)
-            
-            if self.use_init_bkgd and background_rgb.shape[-1] == 4:
-                rgb = background_rgb[:, 0:3]
-                a = background_rgb[:, 3:4]
-                return (1 - a) * init_background_rgb + a * rgb
-            
-            return background_rgb
-        
-        elif self.bkgd_mode == "mlps":
-            x = (pixels_x[:, None] / (self.dataset.W - 1) * 2 - 1)
-            y = (pixels_y[:, None] / (self.dataset.H - 1) * 2 - 1)
-            inputs = torch.cat([x, y], -1)
-            background_rgb = None
-            for i in range(len(self.bg_mlps)):
-                bg = self.bg_mlps[i](inputs)
-                mask = (camera_id == i).float().view(-1, 1)
-                bg = bg * mask
-                if background_rgb is None:
-                    background_rgb = bg
-                else:
-                    background_rgb = background_rgb + bg
-            
-            if self.use_init_bkgd and background_rgb.shape[-1] == 4:
-                rgb = background_rgb[:, 0:3]
-                a = background_rgb[:, 3:4]
-                return (1 - a) * init_background_rgb + a * rgb
-            
-            return background_rgb
-        
-        elif self.bkgd_mode == "tensor":
-            background_rgb = self.bg_tensor[camera_id][(pixels_y, pixels_x)]
-            
-            if self.use_init_bkgd and background_rgb.shape[-1] == 4:
-                rgb = background_rgb[:, 0:3]
-                a = background_rgb[:, 3:4]
-                return (1 - a) * init_background_rgb + a * rgb
-            
-            return background_rgb
+        return background_rgb
 
 
 class Runner:
@@ -141,7 +125,7 @@ class Runner:
 
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
-        self.iso_weight = self.conf.get_float('train.iso_weight')
+        self.iso_weight = self.conf.get_float('train.iso_weight', default=0.0)
         self.mask_weight = self.conf.get_float('train.mask_weight')
         self.is_continue = is_continue
         self.mode = mode
@@ -163,16 +147,27 @@ class Runner:
         params_to_train += list(self.deviation_network.parameters())
         params_to_train += list(self.color_network.parameters())
         
+        # オプティマイザー群
+        self.optimizers = {}
+        
+        # メインオプティマイザー
+        self.optimizers["main"] = torch.optim.Adam(params_to_train, lr=self.learning_rate)
+        
+        # 背景モジュール用オプティマイザー
         if self.bkgd_mode != 'fixed':
-            params_to_train += list(self.bkgd_module.parameters())
+            self.learning_rate_bg = self.conf.get_float('train.learning_rate_bg', default=self.learning_rate)
+            self.optimizers["bg"] = torch.optim.Adam(self.bkgd_module.parameters(), lr=self.learning_rate_bg)
 
-        self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
-
+        # レンダラー
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
                                      self.deviation_network,
                                      self.color_network,
                                      **self.conf['model.neus_renderer'])
+                                     
+        # ISO損失の重みをレンダラーに設定
+        if hasattr(self.renderer, 'iso_weight'):
+            self.renderer.iso_weight = self.iso_weight
 
         # Load checkpoint
         latest_model_name = None
@@ -187,7 +182,7 @@ class Runner:
                         model_list.append(model_name)
                 model_list.sort()
                 latest_model_name = model_list[-1]
-                
+
         if latest_model_name is not None:
             logging.info('Find checkpoint: {}'.format(latest_model_name))
             self.load_checkpoint(latest_model_name)
@@ -219,22 +214,32 @@ class Runner:
             mask = data[:, 9:10]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
-            # カメラID取得（元のNeUSと同様にシンプルに）
+            # カメラID取得
             camera_id = self.dataset.camera_id_at(img_idx)
             
             # デバッグ出力（1000イテレーションごとに表示）
             if self.iter_step % 1000 == 0:
-                print(f"DEBUG: train() img_idx={img_idx}, camera_id={camera_id}, filename={os.path.basename(self.dataset.images_lis[img_idx])}")
+                print(f"DEBUG: train() img_idx={img_idx}, camera_id={camera_id}")
             
-            # ランダムピクセル座標を生成（元のNeUSと同様）
+            # ランダムピクセル座標を生成
             pixels_x = torch.randint(low=0, high=self.dataset.W, size=[self.batch_size], device=self.device)
             pixels_y = torch.randint(low=0, high=self.dataset.H, size=[self.batch_size], device=self.device)
             
-            # 背景RGB
-            if self.use_white_bkgd:
-                background_rgb = torch.ones([1, 3], device=self.device)
+            # 初期背景RGBの取得
+            if hasattr(self.dataset, 'bkgds'):
+                idx_tensor = torch.tensor(camera_id, device=self.device)
+                init_background_rgb = self.dataset.bkgds[camera_id][
+                    (pixels_y.to(torch.int64), pixels_x.to(torch.int64))
+                ]
             else:
-                background_rgb = self.bkgd_module(camera_id, pixels_x, pixels_y, None)
+                # 背景画像がない場合は白か黒を使用
+                if self.use_white_bkgd:
+                    init_background_rgb = torch.ones([self.batch_size, 3], device=self.device)
+                else:
+                    init_background_rgb = torch.zeros([self.batch_size, 3], device=self.device)
+            
+            # 背景RGB
+            background_rgb = self.bkgd_module(camera_id, pixels_x, pixels_y, init_background_rgb)
             
             # レンダリング
             render_out = self.renderer.render(rays_o,
@@ -244,46 +249,67 @@ class Runner:
                                             cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                             background_rgb=background_rgb)
             
+            # マスク処理
+            if self.mask_weight > 0.0:
+                mask = (mask > 0.5).float()
+            else:
+                mask = torch.ones_like(mask)
+                
+            mask_sum = mask.sum() + 1e-5
+            
             # ロス計算
             color_fine = render_out['color_fine']
             color_error = (color_fine - true_rgb) * mask
-            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask.sum()
+            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
             
             s_val = render_out['s_val']
             eikonal_loss = render_out['gradient_error']
             
-            # 最終的なロス
-            loss = color_fine_loss + self.igr_weight * eikonal_loss
+            weight_sum = render_out['weight_sum']
+            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
             
+            # ISO損失
+            iso_loss = torch.tensor(0.0, device=self.device)
             if 'iso_loss' in render_out:
                 iso_loss = render_out['iso_loss']
                 if isinstance(iso_loss, torch.Tensor):
                     if iso_loss.numel() > 1:
                         iso_loss = iso_loss.mean()
-                    loss = loss + self.iso_weight * iso_loss
-                else:
-                    loss = loss + self.iso_weight * iso_loss
             
+            # 最終的なロス
+            loss = color_fine_loss + \
+                   eikonal_loss * self.igr_weight + \
+                   mask_loss * self.mask_weight + \
+                   iso_loss * self.iso_weight
+            
+            # 勾配計算と更新
+            for optimizer in self.optimizers.values():
+                optimizer.zero_grad()
+                
             loss.backward()
             
-            if (iter_i+1) % self.batch_size == 0:
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+            for optimizer in self.optimizers.values():
+                optimizer.step()
             
             self.iter_step += 1
             
             # ログのみ数ステップおきに行うことでパフォーマンス向上
             if self.iter_step % self.report_freq == 0:
                 # モニタリングデータの計算
-                psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask.sum() * 3.0)).sqrt())
-                mask_sum = mask.sum() + 1e-5
+                psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
                 cdf_fine = render_out['cdf_fine']
-                weight_max = render_out['weight_sum']
+                weight_max = render_out['weight_max']
+                
+                # 学習率をログに記録
+                for key, optimizer in self.optimizers.items():
+                    self.writer.add_scalar(f'lr/{key}', optimizer.param_groups[0]['lr'], self.iter_step)
                 
                 # TensorBoardにログを記録
                 self.writer.add_scalar('Loss/loss', loss, self.iter_step)
                 self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
                 self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+                if self.iso_weight > 0:
+                    self.writer.add_scalar('Loss/iso_loss', iso_loss, self.iter_step)
                 self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
                 self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
                 self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
@@ -297,7 +323,7 @@ class Runner:
                 avg_time = total_time / len(step_times)
                 
                 print(self.base_exp_dir)
-                print(f'iter:{self.iter_step:8>d} loss = {loss.item():.6f} lr={self.optimizer.param_groups[0]["lr"]:.6f} time={step_time:.3f}s avg={avg_time:.3f}s')
+                print(f'iter:{self.iter_step:8>d} loss = {loss.item():.6f} lr={self.optimizers["main"].param_groups[0]["lr"]:.6f} time={step_time:.3f}s avg={avg_time:.3f}s')
             
             # 定期的な処理
             if self.iter_step % self.save_freq == 0:
@@ -315,10 +341,7 @@ class Runner:
             
             if self.iter_step % len(image_perm) == 0:
                 image_perm = self.get_image_perm()
-                
-        # メモリ解放のためにキャッシュをクリア
-        if hasattr(self.dataset, 'clear_cache'):
-            self.dataset.clear_cache()
+        
         print('Training finished!')
 
     def get_image_perm(self):
@@ -338,8 +361,18 @@ class Runner:
             progress = (self.iter_step - self.warm_up_end) / (self.end_iter - self.warm_up_end)
             learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
 
-        for g in self.optimizer.param_groups:
-            g['lr'] = self.learning_rate * learning_factor
+        for key, optimizer in self.optimizers.items():
+            if key == "main":
+                lr = self.learning_rate * learning_factor
+            elif key == "bg" and hasattr(self, "learning_rate_bg"):
+                lr = self.learning_rate_bg * learning_factor
+            else:
+                # その他のオプティマイザーがあれば、対応する学習率を取得
+                attr_name = f"learning_rate_{key}"
+                lr = getattr(self, attr_name, self.learning_rate) * learning_factor
+                
+            for g in optimizer.param_groups:
+                g['lr'] = lr
 
     def file_backup(self):
         dir_lis = self.conf['general.recording']
@@ -355,7 +388,13 @@ class Runner:
         copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
     def load_checkpoint(self, checkpoint_name):
-        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device, weights_only=False)
+        # PyTorch 2.6以降では、weights_only=Falseを明示的に指定
+        checkpoint = torch.load(
+            os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name),
+            map_location=self.device,
+            weights_only=False  # セキュリティ制約を緩和
+        )
+        
         self.nerf_outside.load_state_dict(checkpoint['nerf'])
         self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
         self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
@@ -365,10 +404,15 @@ class Runner:
         if 'bkgd_module' in checkpoint and self.bkgd_mode != 'fixed':
             self.bkgd_module.load_state_dict(checkpoint['bkgd_module'])
             
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        # オプティマイザーの読み込み
+        self.optimizers["main"].load_state_dict(checkpoint['optimizer'])
+        
+        if "bg" in self.optimizers and 'bg_optimizer' in checkpoint:
+            self.optimizers["bg"].load_state_dict(checkpoint['bg_optimizer'])
+            
         self.iter_step = checkpoint['iter_step']
 
-        logging.info('End')
+        logging.info('End') 
 
     def save_checkpoint(self):
         checkpoint = {
@@ -376,13 +420,17 @@ class Runner:
             'sdf_network_fine': self.sdf_network.state_dict(),
             'variance_network_fine': self.deviation_network.state_dict(),
             'color_network_fine': self.color_network.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
+            'optimizer': self.optimizers["main"].state_dict(),
             'iter_step': self.iter_step,
         }
         
         # Save background module if not in fixed mode
         if self.bkgd_mode != 'fixed':
             checkpoint['bkgd_module'] = self.bkgd_module.state_dict()
+            
+        # 追加のオプティマイザーの保存
+        if "bg" in self.optimizers:
+            checkpoint['bg_optimizer'] = self.optimizers["bg"].state_dict()
 
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
@@ -396,7 +444,7 @@ class Runner:
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
             
-        # レイを生成（元のNeUSと同様）
+        # レイを生成
         rays_o, rays_d = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
         rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
@@ -406,7 +454,7 @@ class Runner:
         camera_id = self.dataset.camera_id_at(idx)
         print(f'DEBUG: validate_image camera_id: {camera_id} for image idx: {idx}')
 
-        # ピクセル座標を取得（元のNeUSと同様）
+        # ピクセル座標を取得
         _, pixels_x, pixels_y = self.dataset.sample_rays_at(idx, resolution_level=resolution_level)
         pixels_x = pixels_x.flatten().to(self.device)
         pixels_y = pixels_y.flatten().to(self.device)
@@ -423,11 +471,21 @@ class Runner:
         for rays_o_batch, rays_d_batch, pixels_x_batch, pixels_y_batch in zip(rays_o, rays_d, pixels_x_splits, pixels_y_splits):
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
             
-            # 背景RGB（元のNeUSと同様）
-            if self.use_white_bkgd:
-                background_rgb = torch.ones([1, 3], device=self.device)
+            # 初期背景RGB
+            if hasattr(self.dataset, 'bkgds'):
+                idx_tensor = torch.tensor(camera_id, device=self.device)
+                init_background_rgb = self.dataset.bkgds[camera_id][
+                    (pixels_y_batch.to(torch.int64), pixels_x_batch.to(torch.int64))
+                ]
             else:
-                background_rgb = self.bkgd_module(camera_id, pixels_x_batch, pixels_y_batch, None)
+                # 背景画像がない場合は白か黒を使用
+                if self.use_white_bkgd:
+                    init_background_rgb = torch.ones([len(pixels_x_batch), 3], device=self.device)
+                else:
+                    init_background_rgb = torch.zeros([len(pixels_x_batch), 3], device=self.device)
+            
+            # 背景RGB
+            background_rgb = self.bkgd_module(camera_id, pixels_x_batch, pixels_y_batch, init_background_rgb)
             
             # レンダリング
             render_out = self.renderer.render(rays_o_batch,
@@ -508,11 +566,10 @@ class Runner:
         for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
             
-            # 背景色の設定
+            # 補間ビューでは白背景または背景なしで実行
             if self.use_white_bkgd:
                 background_rgb = torch.ones([1, 3], device=self.device)
             else:
-                # 補間ビューでは背景なしで実行
                 background_rgb = None
 
             render_out = self.renderer.render(rays_o_batch,
@@ -634,7 +691,7 @@ class Runner:
 
 
 if __name__ == '__main__':
-    print('Hello Wooden')
+    print('Hello α-NeUS')
 
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
