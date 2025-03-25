@@ -443,7 +443,7 @@ class Runner:
 
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
-            
+                
         # レイを生成
         rays_o, rays_d = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
@@ -473,7 +473,6 @@ class Runner:
             
             # 初期背景RGB
             if hasattr(self.dataset, 'bkgds'):
-                idx_tensor = torch.tensor(camera_id, device=self.device)
                 init_background_rgb = self.dataset.bkgds[camera_id][
                     (pixels_y_batch.to(torch.int64), pixels_x_batch.to(torch.int64))
                 ]
@@ -518,40 +517,68 @@ class Runner:
         img_fine = None
         if len(out_rgb_fine) > 0:
             img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
-            
-        # アルファ情報（前景マスク）
-        alpha_fine = None
-        if len(out_weight_sum) > 0:
-            alpha_fine = np.concatenate(out_weight_sum, axis=0).reshape([H, W, -1])
+        
+        # マスクを読み込む（dataset_lru.pyにmask_atメソッドを追加する必要あり）
+        mask_img = None
+        try:
+            mask_path = self.dataset.masks_lis[idx]
+            mask_img = cv.imread(mask_path, cv.IMREAD_GRAYSCALE)
+            if mask_img is not None:
+                mask_img = cv.resize(mask_img, (W, H)) / 255.0
+        except Exception as e:
+            print(f"マスク読み込みエラー: {e}")
+        
+        # 背景画像を取得
+        background_img = None
+        try:
+            background_img = self.dataset.bkgd_at(idx, resolution_level=resolution_level)
+        except Exception as e:
+            print(f"背景読み込みエラー: {e}")
+            background_img = np.zeros((H, W, 3))
+        
+        # ディレクトリ作成
+        os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
+        os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
 
+        # 法線画像の処理
         normal_img = None
         if len(out_normal_fine) > 0:
             normal_img = np.concatenate(out_normal_fine, axis=0)
             rot = np.linalg.inv(self.dataset.pose_all[idx, :3, :3].detach().cpu().numpy())
             normal_img = (np.matmul(rot[None, :, :], normal_img[:, :, None])
                         .reshape([H, W, 3, -1]) * 128 + 128).clip(0, 255)
-
-        # ディレクトリ作成
-        os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
-        os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
+            
+        # Ground Truth画像を取得
+        gt_img = self.dataset.image_at(idx, resolution_level=resolution_level)
 
         # 結果の保存
         for i in range(img_fine.shape[-1]):
             if len(out_rgb_fine) > 0:
-                # Ground Truth画像を取得
-                gt_img = self.dataset.image_at(idx, resolution_level)
-                
-                # レンダリング結果とGround Truthを並べて保存
-                cv.imwrite(os.path.join(self.base_exp_dir,
-                                      'validations_fine',
-                                      '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
-                          np.concatenate([img_fine[..., i].astype(np.uint8), gt_img]))
+                # マスク処理を適用
+                if mask_img is not None:
+                    # レンダリング結果にマスク適用
+                    rendered_img = img_fine[..., i].astype(np.float32) / 255.0
+                    mask_3ch = np.stack([mask_img] * 3, axis=2)
+                    masked_render = rendered_img * mask_3ch + background_img * (1 - mask_3ch)
+                    masked_render = (masked_render * 255).astype(np.uint8)
+                    
+                    # 保存
+                    cv.imwrite(os.path.join(self.base_exp_dir,
+                                        'validations_fine',
+                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                            np.concatenate([masked_render, gt_img]))
+                else:
+                    # マスクがない場合は通常通り保存
+                    cv.imwrite(os.path.join(self.base_exp_dir,
+                                        'validations_fine',
+                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                            np.concatenate([img_fine[..., i].astype(np.uint8), gt_img]))
                 
             if len(out_normal_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
-                                      'normals',
-                                      '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
-                          normal_img[..., i])
+                                    'normals',
+                                    '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                        normal_img[..., i])
 
     def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
         """

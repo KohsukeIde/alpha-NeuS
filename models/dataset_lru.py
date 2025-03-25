@@ -322,6 +322,27 @@ class Dataset:
         except Exception as e:
             logging.error(f"Error loading mask at index {idx}: {e}")
             raise  # エラーを上位に伝播
+        
+    def mask_at(self, idx, resolution_level):
+        """解像度を落としてマスク画像を返す"""
+        if idx >= self.n_images:
+            raise IndexError(f"Image index {idx} out of range (0-{self.n_images-1})")
+        
+        # マスク画像のパス
+        mask_path = self.masks_lis[idx]
+        
+        try:
+            # マスクの読み込み
+            msk = cv.imread(mask_path, cv.IMREAD_GRAYSCALE)
+            if msk is None:
+                print(f"WARNING: Failed to load mask: {mask_path}, using empty mask")
+                msk = np.zeros((self.H, self.W), dtype=np.uint8)
+        except Exception as e:
+            print(f"ERROR: Error loading mask: {mask_path}, {e}")
+            msk = np.zeros((self.H, self.W), dtype=np.uint8)
+            
+        # 解像度を落としてリサイズ
+        return (cv.resize(msk, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
 
     def clear_cache(self):
         """キャッシュをクリアしてメモリを解放"""

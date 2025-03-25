@@ -276,6 +276,7 @@ class NeuSRenderer:
 
         color = (sampled_color * weights[:, :, None]).sum(dim=1)
         if background_rgb is not None:    # Fixed background, usually black
+            print(f"weights_sum: {weights_sum}")
             color = color + background_rgb * (1.0 - weights_sum)
 
         # Eikonal loss
